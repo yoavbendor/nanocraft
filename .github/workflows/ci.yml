@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.cxx }} ${{ matrix.config }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cxx: g++-13,     config: Release,   sanitizer: "",                  werror: "ON" }
+          - { cxx: clang++-18, config: Release,   sanitizer: "",                  werror: "ON" }
+          # GCC's -Warray-bounds is noisy under sanitizer instrumentation: no -Werror there.
+          - { cxx: g++-13,     config: asan-ubsan, sanitizer: "address,undefined", werror: "OFF" }
+          - { cxx: clang++-18, config: asan-ubsan, sanitizer: "address,undefined", werror: "OFF" }
+          - { cxx: g++-13,     config: profile,   sanitizer: "",                  werror: "ON", profile: "ON" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python oracle modules (dpkt, scapy)
+        run: python3 -m pip install --user dpkt scapy
+
+      - name: Configure (nanom via FetchContent, pinned)
+        run: >
+          cmake -S . -B build
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCMAKE_BUILD_TYPE=${{ matrix.sanitizer && 'RelWithDebInfo' || 'Release' }}
+          -DNANOCRAFT_SANITIZER=${{ matrix.sanitizer }}
+          -DNANOCRAFT_WERROR=${{ matrix.werror }}
+          -DNANOCRAFT_PROFILE=${{ matrix.profile || 'OFF' }}
+
+      - name: Build
+        run: cmake --build build -j4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Live TX tests on lo (AF_PACKET needs CAP_NET_RAW)
+        run: sudo ./build/tests/test_linux_tx
+
+      - name: Bench smoke
+        if: matrix.sanitizer == ''
+        run: ./build/bench/craft_bench all 200000
