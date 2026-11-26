@@ -111,7 +111,7 @@ static bool live_tests() {
     std::printf("SKIP live TX: cannot open a receive socket\n");
     return false;
   }
-  auto tm = nanocraft::compile(nanocraft::stack(eth{.dst = {2, 0, 0, 0, 0, 1}, .src = {2, 0, 0, 0, 0, 2}, .ethertype = kMarker}));
+  auto tm = nanocraft::compile(nanocraft::stack(eth{.dst = {2, 0, 0, 0, 0, 1}, .src = {2, 0, 0, 0, 0, 2}, .type = kMarker}));
 
   // 1. TX ring, frames crafted in place
   {

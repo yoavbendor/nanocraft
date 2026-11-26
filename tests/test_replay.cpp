@@ -57,7 +57,7 @@ int main() {
           if (!shape.matches(pkt)) return true;
           ++matched;
           nanocraft::frame_ref<eth, vlan, ipv4, udp, someip> f(shape, pkt);
-          f.set<"ipv4.dst">(ip4{192, 168, 0, 9});
+          f.set<"ipv4.dst">(ipv4_addr{192, 168, 0, 9});
           f.set<"someip.session_id">(f.get<"someip.session_id">() ^ 0x5a5a);
           f.set<"ipv4.ttl">(3);
           return true;

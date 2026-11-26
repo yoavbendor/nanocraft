@@ -25,7 +25,7 @@ struct rec {
 
 static auto make_template() {
   return nanocraft::compile(eth{.dst = {0x01, 0x00, 0x5e, 0, 0, 1}, .src = {2, 0, 0, 0, 0, 0xaa}} /
-                            vlan{.pcp = {3}, .vid = {100}} /
+                            vlan{.vid = 100, .pcp = 3} /
                             ipv4{.src = {10, 0, 0, 1}, .dst = {239, 0, 0, 1}} / udp{.src_port = 30501, .dst_port = 30501} /
                             someip{.service_id = 0x1234, .method_id = 0x8001, .client_id = 1});
 }

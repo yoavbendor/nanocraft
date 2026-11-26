@@ -1,66 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-// Frame templates vs two independent builders: the hand-written RFC builder (reference.hpp) and
-// nanom::emit with computed<> fields; for many random field values, payload sizes and stacks.
+// Frame templates vs two builders: the hand-written RFC builder (reference.hpp) and nanowire's own
+// builders (nanowire::make_frame); and vs nanowire's reader (packet::parse + views, nw_check.hpp):
+// reading and crafting must agree. For many random field values, payload sizes and stacks.
 #include <nanocraft/nanocraft.hpp>
 
 #include "check.hpp"
+#include "nw_check.hpp"
 #include "reference.hpp"
 
-#include <nanom/emit.hpp>
+#include <nanowire/build.hpp>
 
 using namespace nanocraft::proto;
 namespace nm = nanom;
 using nanocraft::csum_policy;
 
-// ---- nanom emit oracle: lengths and the IPv4 checksum via nanom's own computed<> mechanism
-template <>
-struct nm::computed<ipv4> {
-  static constexpr auto fields = std::tuple{
-      nm::calc<"total_length">([](const ipv4&, const nm::emit_ctx& c) { return 20 + c.payload.size(); }),
-      nm::checksum<"checksum">([](std::span<const std::byte> h, const nm::emit_ctx&) { return ref::naive_csum(h); })};
-};
-template <>
-struct nm::computed<udp> {
-  static constexpr auto fields =
-      std::tuple{nm::calc<"length">([](const udp&, const nm::emit_ctx& c) { return 8 + c.payload.size(); })};
-};
-template <>
-struct nm::computed<someip> {
-  static constexpr auto fields =
-      std::tuple{nm::calc<"length">([](const someip&, const nm::emit_ctx& c) { return 8 + c.payload.size(); })};
-};
-
-static ref::bytes nanom_build(const eth& e, const vlan& v, const ipv4& ip, const udp& u, const someip& s,
-                              std::span<const std::byte> pay) {
-  std::vector<std::byte> buf(2048);
-  std::byte* end = buf.data() + buf.size();
-  std::byte* p = end - pay.size();
-  if (!pay.empty()) std::memcpy(p, pay.data(), pay.size());
-  p -= 16;
-  (void)nm::emit(s, {p, 16}, nm::emit_ctx{{p + 16, pay.size()}}, std::endian::big);
-  p -= 8;
-  (void)nm::emit(u, {p, 8}, nm::emit_ctx{{p + 8, std::size_t(end - p - 8)}}, std::endian::big);
-  // UDP checksum is not expressible in computed<> (needs the IP pseudo header): compute here.
-  {
-    ref::bytes ps;
-    for (auto b : ip.src) ref::put8(ps, b);
-    for (auto b : ip.dst) ref::put8(ps, b);
-    ref::put8(ps, 0);
-    ref::put8(ps, 17);
-    ref::put16(ps, unsigned(end - p));
-    ps.insert(ps.end(), p, end);
-    unsigned c = ref::naive_csum(ps);
-    if (c == 0) c = 0xffff;
-    p[6] = std::byte(c >> 8);
-    p[7] = std::byte(c);
-  }
-  p -= 20;
-  (void)nm::emit(ip, {p, 20}, nm::emit_ctx{{p + 20, std::size_t(end - p - 20)}}, std::endian::big);
-  p -= 4;
-  (void)nm::emit(v, {p, 4}, {}, std::endian::big);
-  p -= 14;
-  (void)nm::emit(e, {p, 14}, {}, std::endian::big);
-  return ref::bytes(p, end);
+// ---- nanowire oracle: the same protocol definitions' own builders (nanowire::build_frame derives
+// every type / length field and computes the IPv4 and UDP checksums itself).
+static ref::bytes nanowire_build(const eth& e, const vlan& v, const ipv4& ip, const udp& u, const someip& s,
+                                 std::span<const std::byte> pay) {
+  auto f = nanowire::make_frame(e, v, ip, u, s, nanowire::raw{pay});
+  CHECK(f.has_value());
+  return f ? *f : ref::bytes{};
 }
 
 template <class A>
@@ -78,7 +38,7 @@ static ref::spec random_spec(std::size_t nvlan, bool v6) {
   s.dscp = unsigned(t::rnd(0, 63));
   s.ecn = unsigned(t::rnd(0, 3));
   s.ident = unsigned(t::rnd(0, 65535));
-  s.flags = unsigned(t::rnd(0, 7));
+  s.flags = unsigned(t::rnd(0, 3));  // DF, MF (the reserved bit: test_patched_vs_reference)
   s.frag = 0;
   s.ttl = unsigned(t::rnd(1, 255));
   fill(s.src4);
@@ -105,31 +65,26 @@ static ref::spec random_spec(std::size_t nvlan, bool v6) {
 // Stack values from a spec (constructor path).
 static eth eth_of(const ref::spec& s) { return eth{.dst = s.dst, .src = s.src}; }
 static vlan vlan_of(const ref::vlan_tag& v) {
-  vlan x{};
-  x.pcp.v = std::uint8_t(v.pcp);
-  x.dei.v = std::uint8_t(v.dei);
-  x.vid.v = std::uint16_t(v.vid);
-  return x;
+  return vlan{.vid = std::uint16_t(v.vid), .pcp = std::uint8_t(v.pcp), .dei = v.dei != 0};
 }
+// nanowire::ipv4 has no field for the reserved ("evil") flag bit: the constructor path uses
+// flags & 3, the patched path sets ipv4.reserved too.
 static ipv4 ipv4_of(const ref::spec& s) {
-  ipv4 x{};
-  x.dscp.v = std::uint8_t(s.dscp);
-  x.ecn.v = std::uint8_t(s.ecn);
-  x.identification = std::uint16_t(s.ident);
-  x.flags.v = std::uint8_t(s.flags);
-  x.ttl = std::uint8_t(s.ttl);
-  x.src = s.src4;
-  x.dst = s.dst4;
-  return x;
+  return ipv4{.src = s.src4,
+              .dst = s.dst4,
+              .ttl = std::uint8_t(s.ttl),
+              .dscp = std::uint8_t(s.dscp),
+              .ecn = std::uint8_t(s.ecn),
+              .id = std::uint16_t(s.ident),
+              .df = ((s.flags >> 1) & 1) != 0,
+              .mf = (s.flags & 1) != 0};
 }
 static ipv6 ipv6_of(const ref::spec& s) {
-  ipv6 x{};
-  x.traffic_class.v = std::uint8_t(s.tclass);
-  x.flow_label.v = std::uint32_t(s.flow);
-  x.hop_limit = std::uint8_t(s.hop);
-  x.src = s.src6;
-  x.dst = s.dst6;
-  return x;
+  return ipv6{.src = s.src6,
+              .dst = s.dst6,
+              .traffic_class = std::uint8_t(s.tclass),
+              .flow_label = std::uint32_t(s.flow),
+              .hop_limit = std::uint8_t(s.hop)};
 }
 static udp udp_of(const ref::spec& s) { return udp{.src_port = std::uint16_t(s.sport), .dst_port = std::uint16_t(s.dport)}; }
 static someip someip_of(const ref::spec& s) {
@@ -172,7 +127,9 @@ static void patch_v4(T& t, const ref::spec& s) {
   t.template set<"ipv4.dscp">(s.dscp);
   t.template set<"ipv4.ecn">(s.ecn);
   t.template set<"ipv4.identification">(s.ident);
-  t.template set<"ipv4.flags">(s.flags);
+  t.template set<"ipv4.reserved">(s.flags >> 2);
+  t.template set<"ipv4.df">((s.flags >> 1) & 1);
+  t.template set<"ipv4.mf">(s.flags & 1);
   t.template set<"ipv4.ttl">(s.ttl);
   t.template set<"ipv4.src">(s.src4);
   t.template set<"ipv4.dst">(s.dst4);
@@ -185,32 +142,34 @@ static void test_constructed_vs_reference() {
       auto s = random_spec(0, false);
       auto tm = nanocraft::compile(eth_of(s) / ipv4_of(s) / udp_of(s) / someip_of(s), s.payload.size());
       CHECK(tm.ok());
-      CHECK_BYTES(write(tm, s.payload), ref::build(s));
+      const auto f = write(tm, s.payload);
+      CHECK_BYTES(f, ref::build(s));
+      nw::check_read(f, s);
     }
     {
       auto s = random_spec(1, false);
       auto tm = nanocraft::compile(eth_of(s) / vlan_of(s.vlans[0]) / ipv4_of(s) / udp_of(s) / someip_of(s));
-      CHECK_BYTES(write(tm, s.payload), ref::build(s));
-      // the nanom emit oracle agrees too
-      auto e = eth_of(s);
-      e.ethertype = 0x8100;
-      auto v = vlan_of(s.vlans[0]);
-      v.ethertype = 0x0800;
-      auto ip = ipv4_of(s);
-      ip.protocol = 17;
-      CHECK_BYTES(write(tm, s.payload), nanom_build(e, v, ip, udp_of(s), someip_of(s), s.payload));
+      const auto f = write(tm, s.payload);
+      CHECK_BYTES(f, ref::build(s));
+      // nanowire's own builders agree, and so does nanowire's reader
+      CHECK_BYTES(f, nanowire_build(eth_of(s), vlan_of(s.vlans[0]), ipv4_of(s), udp_of(s), someip_of(s), s.payload));
+      nw::check_read(f, s);
     }
     {
       auto s = random_spec(2, false);
       auto tm = nanocraft::compile(eth_of(s) / vlan_of(s.vlans[0]) / vlan_of(s.vlans[1]) / ipv4_of(s) / udp_of(s) /
                                    someip_of(s));
-      CHECK_BYTES(write(tm, s.payload), ref::build(s));
+      const auto f = write(tm, s.payload);
+      CHECK_BYTES(f, ref::build(s));
+      nw::check_read(f, s);
     }
     // IPv6
     {
       auto s = random_spec(1, true);
       auto tm = nanocraft::compile(eth_of(s) / vlan_of(s.vlans[0]) / ipv6_of(s) / udp_of(s) / someip_of(s));
-      CHECK_BYTES(write(tm, s.payload), ref::build(s));
+      const auto f = write(tm, s.payload);
+      CHECK_BYTES(f, ref::build(s));
+      nw::check_read(f, s);
     }
   }
 }
@@ -228,12 +187,15 @@ static void test_patched_vs_reference() {
   for (int it = 0; it < 2000; ++it) {
     {
       auto s = random_spec(1, false);
+      s.flags = unsigned(t::rnd(0, 7));
       patch_common(t4, s);
       patch_v4(t4, s);
       t4.set<"vlan.pcp">(s.vlans[0].pcp);
       t4.set<"vlan.dei">(s.vlans[0].dei);
       t4.set<"vlan.vid">(s.vlans[0].vid);
-      CHECK_BYTES(write(t4, s.payload), ref::build(s));
+      const auto f = write(t4, s.payload);
+      CHECK_BYTES(f, ref::build(s));
+      nw::check_read(f, s);
       // header() is a valid frame with a zero payload of the current size
       auto z = s;
       z.payload.assign(s.payload.size(), std::byte{0});
@@ -255,7 +217,9 @@ static void test_patched_vs_reference() {
       t6.set(vid1, s.vlans[1].vid);
       t6.set(pcp1, s.vlans[1].pcp);
       t6.set(t6.find("vlan[1].dei"), s.vlans[1].dei);
-      CHECK_BYTES(write(t6, s.payload), ref::build(s));
+      const auto f = write(t6, s.payload);
+      CHECK_BYTES(f, ref::build(s));
+      nw::check_read(f, s);
       CHECK_EQ(t6.get(vid1), s.vlans[1].vid);
       CHECK_EQ(t6.get<"ipv6.flow_label">(), s.flow);
     }
@@ -325,10 +289,13 @@ static void test_policies() {
     CHECK_EQ(ref::get16(f, 14 + 20 + 6), unsigned(ref::naive_sum(ps)));
     CHECK(ref::verify(f).ip_ok);
   }
-  // keep: the layer's own value, untouched by patches
+  // keep: the layer's own value, untouched by patches (an explicit builder .checksum starts as keep)
   auto u = udp_of(s);
   u.checksum = 0xbeef;
   auto tk = nanocraft::compile(eth_of(s) / ipv4_of(s) / u / someip_of(s));
+  CHECK(tk.checksum_policy(1) == csum_policy::keep);
+  CHECK(tk.checksum_policy(0) == csum_policy::compute);
+  CHECK_EQ(tk.get<"udp.checksum">(), 0xbeefu);
   CHECK(tk.checksum("udp.checksum", csum_policy::keep));
   tk.set<"someip.session_id">(77);
   auto f = write(tk, s.payload);
@@ -516,7 +483,7 @@ static void test_tp_link() {
   CHECK_EQ(tm.get<"ipv4.protocol">(), 17u);
   CHECK_EQ(tm.get<"someip.length">(), 12u);
   // explicit next-protocol values are kept
-  auto tx = nanocraft::compile(eth{.ethertype = 0x88b5} / ipv4{.protocol = 253} / udp{} / someip{});
+  auto tx = nanocraft::compile(eth{.type = 0x88b5} / ipv4{.protocol = 253} / udp{} / someip{});
   CHECK_EQ(tx.get<"eth.ethertype">(), 0x88b5u);
   CHECK_EQ(tx.get<"ipv4.protocol">(), 253u);
 }

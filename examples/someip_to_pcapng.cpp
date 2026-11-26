@@ -16,8 +16,8 @@ int main(int argc, char** argv) {
   // Describe the stack once. Lengths, next-protocol fields and checksums are filled in.
   auto t = nanocraft::compile(
       eth{.dst = {0x01, 0x00, 0x5e, 0x00, 0x00, 0x01}, .src = {0x02, 0, 0, 0, 0, 0x01}} /
-      vlan{.pcp = {5}, .vid = {100}} /
-      ipv4{.ttl = 8, .src = {10, 0, 0, 1}, .dst = {239, 0, 0, 1}} /
+      vlan{.vid = 100, .pcp = 5} /
+      ipv4{.src = ip4("10.0.0.1"), .dst = ip4("239.0.0.1"), .ttl = 8} /
       udp{.src_port = 30501, .dst_port = 30501} /
       someip{.service_id = 0x1234, .method_id = 0x8001, .client_id = 0x0001});
 

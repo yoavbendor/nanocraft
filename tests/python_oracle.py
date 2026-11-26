@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Independent third-party readers over the captures test_pcap writes.
+"""Independent third-party readers over the captures test_pcap and test_nanowire write.
 
 dpkt reads every pcap / pcapng file and counts frames; scapy parses Ether/Dot1Q/IP/UDP, recomputes
-the IPv4 and UDP checksums from scratch and compares, and checks the SOME/IP length field. Exits 77
-(ctest SKIP) when dpkt or scapy is not installed.
+the IPv4 and UDP checksums from scratch and compares, and checks the SOME/IP length field. Over
+nanocraft_nanowire.pcap (templates of nanowire's layers: TCP, IPv6, QinQ, SOME/IP-SD, SoAd / IpduM)
+scapy recomputes every IPv4 / UDP / TCP checksum and length over IPv4 and IPv6. Exits 77 (ctest
+SKIP) when dpkt or scapy is not installed.
 """
 import os
 import struct
@@ -16,7 +18,7 @@ sys.modules.setdefault("cryptography", None)
 
 try:
     import dpkt
-    from scapy.all import Ether, IP, UDP, Dot1Q, raw  # noqa: F401
+    from scapy.all import Ether, IP, IPv6, TCP, UDP, Dot1Q, raw  # noqa: F401
     from scapy.utils import rdpcap
 except BaseException as e:  # pragma: no cover
     print("python oracle skipped:", e)
@@ -77,6 +79,32 @@ def check_frames(path):
     return n
 
 
+def check_nanowire_frames(path):
+    n = 0
+    for p in rdpcap(path):
+        n += 1
+        l3 = IP if IP in p else IPv6 if IPv6 in p else None
+        l4 = UDP if UDP in p else TCP if TCP in p else None
+        if l3 is None or l4 is None:
+            fail(f"{path}: frame {n} is not IP(v6)/UDP|TCP")
+            continue
+        got = p[l4].chksum
+        q = p.copy()
+        if l3 is IP:
+            del q[IP].chksum
+            del q[IP].len
+        else:
+            del q[IPv6].plen
+        del q[l4].chksum
+        if l4 is UDP:
+            del q[UDP].len
+        q = Ether(raw(q))
+        if raw(q) != raw(p):
+            what = "IPv4 checksum / lengths" if q[l4].chksum == got else f"{l4.__name__} checksum"
+            fail(f"{path}: frame {n}: scapy rebuilds different bytes ({what})")
+    return n
+
+
 if len(manifest) != 4:
     fail(f"manifest lists {len(manifest)} files, expected 4")
 for name, frames in manifest.items():
@@ -87,8 +115,17 @@ for name, frames in manifest.items():
     s = check_frames(path)
     if s != frames:
         fail(f"{name}: scapy read {s} frames, expected {frames}")
+nw_path = os.path.join(d, "nanocraft_nanowire.pcap")
+nw_frames = 0
+if os.path.exists(nw_path):
+    nw_frames = check_nanowire_frames(nw_path)
+    if nw_frames == 0 or dpkt_count(nw_path) != nw_frames:
+        fail(f"nanocraft_nanowire.pcap: {nw_frames} frames")
+else:
+    fail("nanocraft_nanowire.pcap missing (test_nanowire writes it)")
 if failures:
     print(f"python oracle: {failures} failures")
     sys.exit(1)
 print("python oracle: dpkt + scapy read " + ", ".join(f"{k}={v}" for k, v in manifest.items()) +
-      " frames; every IPv4/UDP checksum and IPv4/UDP/SOME-IP length re-verified by scapy")
+      f", nanocraft_nanowire.pcap={nw_frames} frames; every IPv4/UDP/TCP checksum and IPv4/IPv6/UDP/SOME-IP"
+      " length re-verified by scapy")

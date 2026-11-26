@@ -2,11 +2,13 @@
 // Segmentation: SOME/IP-TP, IPv4 fragments and IPv6 fragment headers. Every segment is checked
 // against the spec (offsets, More flag, alignment, sizes, checksums via the independent verifier),
 // compared byte for byte with the hand-written reference builder, and a small reference
-// reassembler must reproduce the original message. Payload chunks must point into the caller's
-// payload (zero copy).
+// reassembler must reproduce the original message. nanowire's reader and reassemblers (the same
+// protocol definitions) must read every segment and rebuild the message too. Payload chunks must
+// point into the caller's payload (zero copy).
 #include <nanocraft/nanocraft.hpp>
 
 #include "check.hpp"
+#include "nw_check.hpp"
 #include "reference.hpp"
 
 #include <map>
@@ -69,8 +71,8 @@ static void tp_case(std::size_t n, std::size_t max_payload, bool zero_udp_csum) 
   s.mtype = 0x02;
   s.tp = true;
   if (zero_udp_csum) s.udp_csum = ref::spec::csum_zero;
-  auto tm = nanocraft::compile(eth{.dst = s.dst, .src = s.src} / vlan{.pcp = {5}, .vid = {42}} /
-                               ipv4{.identification = 0x1234, .src = s.src4, .dst = s.dst4} /
+  auto tm = nanocraft::compile(eth{.dst = s.dst, .src = s.src} / vlan{.vid = 42, .pcp = 5} /
+                               ipv4{.src = s.src4, .dst = s.dst4, .id = 0x1234} /
                                udp{.src_port = 30509, .dst_port = 30509} /
                                someip{.service_id = 0x4321, .method_id = 0x8005, .client_id = 1, .session_id = 0x77} /
                                someip_tp{});
@@ -80,6 +82,10 @@ static void tp_case(std::size_t n, std::size_t max_payload, bool zero_udp_csum) 
   const auto msg = t::random_bytes(n);
   const std::size_t step = (max_payload / 16) * 16;
   tp_reassembler ra;
+  nanowire::someip_tp_reassembler nra(nw::roomy(nanowire::tp_reassembly_defaults()));
+  std::vector<ref::bytes> frames;  // nanowire's reassembler keeps views into them
+  frames.reserve(seg.count(n));
+  bool nw_done = false;
   std::size_t k = 0, off = 0;
   const std::size_t nseg = seg.run(msg, [&](const nanocraft::gather& g) {
     const auto f = flat(g);
@@ -106,10 +112,29 @@ static void tp_case(std::size_t n, std::size_t max_payload, bool zero_udp_csum) 
     ss.tp_more = more;
     ss.payload.assign(msg.begin() + std::ptrdiff_t(off), msg.begin() + std::ptrdiff_t(off + data));
     CHECK_BYTES(f, ref::build(ss));
+    nw::check_read(f, ss);
+    frames.push_back(f);
+    const auto pkt = nanowire::packet::parse(frames.back());
+    const auto r = nanowire::feed(nra, pkt, *pkt.someip(), 0);
+    CHECK(r.status != nanowire::frag_status::dropped);
+    if (r.complete()) {
+      CHECK(!more);
+      nw_done = true;
+      const auto whole = nw::join(r);  // rebuilt 16-byte header (TP flag cleared) + message
+      const auto m = nanowire::someip_view::parse(whole);
+      CHECK(m.has_value());
+      if (m) {
+        CHECK(!m->is_tp());
+        CHECK_EQ(unsigned(m->session_id()), 0x77u);
+        CHECK_EQ(std::size_t(m->length()), 8 + n);
+        CHECK_BYTES(m->payload(), std::span<const std::byte>(msg));
+      }
+    }
     off += data;
     ++k;
   });
   CHECK_EQ(nseg, k);
+  CHECK(nw_done);
   CHECK_EQ(nseg, seg.count(n));
   CHECK_EQ(nseg, n == 0 ? std::size_t(1) : (n + step - 1) / step);
   ref::bytes out;
@@ -153,7 +178,7 @@ static void ipv4_frag_case(std::size_t n, std::size_t mtu) {
   s.session = 9;
   s.payload = t::random_bytes(n);
   auto tm = nanocraft::compile(eth{.dst = s.dst, .src = s.src} /
-                               ipv4{.identification = 0xbeef, .ttl = 17, .src = s.src4, .dst = s.dst4} /
+                               ipv4{.src = s.src4, .dst = s.dst4, .ttl = 17, .id = 0xbeef} /
                                udp{.src_port = 1000, .dst_port = 30490} /
                                someip{.service_id = 0xffff, .method_id = 0x8100, .session_id = 9});
   nanocraft::segmenter seg(tm, ipv4_fragments(mtu));
@@ -162,7 +187,11 @@ static void ipv4_frag_case(std::size_t n, std::size_t mtu) {
   ip_reassembler ra;
   std::size_t off = 0;
   ref::bytes first_hdr;
+  nanowire::ipv4_reassembler nra(nw::roomy(nanowire::ip_reassembly_defaults()));
+  std::vector<ref::bytes> frames;
+  bool nw_done = false;
   const auto segs = seg.segment(s.payload);
+  frames.reserve(segs.size());
   for (std::size_t k = 0; k < segs.size(); ++k) {
     const auto& g = segs[k];
     const auto f = flat(g);
@@ -180,7 +209,25 @@ static void ipv4_frag_case(std::size_t n, std::size_t mtu) {
     ra.add(off, mf, std::span<const std::byte>(f).subspan(34));
     off += data;
     if (k == 0) first_hdr.assign(f.begin(), f.begin() + 34);
+    // nanowire reads the fragment and reassembles the datagram
+    frames.push_back(f);
+    const auto pkt = nanowire::packet::parse(frames.back());
+    CHECK(pkt.ipv4() && pkt.ipv4()->checksum_ok());
+    CHECK_EQ(pkt.is_fragment(), segs.size() > 1);
+    if (segs.size() == 1) {
+      nw::check_read(f, s);
+      nw_done = true;
+      continue;
+    }
+    const auto r = nanowire::feed(nra, pkt, 0);
+    CHECK(r.status != nanowire::frag_status::dropped && r.status != nanowire::frag_status::not_fragment);
+    if (r.complete()) {
+      nw_done = true;
+      const auto dg = nw::join(r);
+      nw::check_datagram(std::span<const std::byte>(first_hdr).subspan(14, 20), dg, s);
+    }
   }
+  CHECK(nw_done);
   ref::bytes l4;
   CHECK(ra.result(l4));
   const auto want = ref::build(s);
@@ -206,16 +253,29 @@ static void ipv6_frag_case(std::size_t n, std::size_t mtu) {
   s.service = 0x1111;
   s.session = 3;
   s.payload = t::random_bytes(n);
-  auto tm = nanocraft::compile(eth{} / ipv6{.hop_limit = 1, .src = s.src6, .dst = s.dst6} /
-                               ipv6_frag{.identification = 0xcafe0001} / udp{.src_port = 30490, .dst_port = 30490} /
+  auto tm = nanocraft::compile(eth{} / ipv6{.src = s.src6, .dst = s.dst6, .hop_limit = 1} /
+                               ipv6_frag{.id = 0xcafe0001} / udp{.src_port = 30490, .dst_port = 30490} /
                                someip{.service_id = 0x1111, .session_id = 3});
   nanocraft::segmenter seg(tm, ipv6_fragments(mtu));
   CHECK(seg.ok());
   const std::size_t step = ((mtu - 48) / 8) * 8;
   ip_reassembler ra;
+  nanowire::ipv6_reassembler nra(nw::roomy(nanowire::ip_reassembly_defaults()));
+  std::vector<ref::bytes> frames;
+  frames.reserve(seg.count(n));
+  bool nw_done = false;
   std::size_t off = 0, k = 0;
   const std::size_t nseg = seg.run(s.payload, [&](const nanocraft::gather& g) {
     const auto f = flat(g);
+    frames.push_back(f);
+    const auto pkt = nanowire::packet::parse(frames.back());
+    CHECK(pkt.ipv6_fragment().has_value());
+    const auto r = nanowire::feed(nra, pkt, 0);
+    CHECK(r.status != nanowire::frag_status::dropped && r.status != nanowire::frag_status::not_fragment);
+    if (r.complete()) {
+      nw_done = true;
+      nw::check_datagram(std::span<const std::byte>(f).subspan(14, 40), nw::join(r), s);
+    }
     CHECK(f.size() <= 14 + mtu);
     CHECK_EQ(ref::get16(f, 12), 0x86ddu);
     CHECK_EQ(unsigned(std::uint8_t(f[14 + 6])), 44u);
@@ -233,6 +293,7 @@ static void ipv6_frag_case(std::size_t n, std::size_t mtu) {
     ++k;
   });
   CHECK_EQ(nseg, k);
+  CHECK(nw_done);
   ref::bytes l4;
   CHECK(ra.result(l4));
   const auto want = ref::build(s);  // no fragment header: the UDP checksum is over the same datagram

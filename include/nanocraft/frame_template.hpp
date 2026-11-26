@@ -2,7 +2,7 @@
 // nanocraft/frame_template.hpp — compiled frame templates: describe a stack once, then craft frames
 // by patching a prebuilt byte image instead of re-encoding every layer.
 //
-//   using namespace nanocraft::proto;                    // or nanowire's layers, later
+//   using namespace nanocraft::proto;                    // nanowire's builders (nanowire_layers.hpp)
 //   auto t = nanocraft::compile(eth{...} / vlan{...} / ipv4{...} / udp{...} / someip{...});
 //
 //   t.set<"someip.session_id">(42);                     // compile-time patch point
@@ -12,8 +12,9 @@
 //   auto id = t.find("someip.session_id");              // runtime name -> handle
 //   t.set(id, 43);
 //
-// What compile() does, once: links the layers (fills next-protocol fields left at 0), encodes every
-// layer with nanom::emit, resolves every described field of every layer to a patch point (byte
+// What compile() does, once: links the layers (next-protocol fields left unset take the next
+// layer's), encodes every layer (a nanowire builder writes itself; a described struct goes through
+// nanom::emit), resolves every described field of every layer to a patch point (byte
 // offset, byte span, bit shift and width, byte order), resolves length chains (IPv4 total length,
 // UDP length, SOME/IP length, ...) and checksum slots (IPv4 header, UDP with its pseudo header),
 // and precomputes, per patch point, which 16-bit checksum windows it touches.
@@ -175,7 +176,7 @@ constexpr std::size_t str_find(std::string_view s, char c) noexcept {
 template <class... L>
 struct stack_meta {
   static constexpr std::size_t nlayers = sizeof...(L);
-  static constexpr std::array<std::size_t, nlayers> sizes{nanom::wire_size_v<L>...};
+  static constexpr std::array<std::size_t, nlayers> sizes{nanom::wire_size_v<wire_t<L>>...};
   static constexpr std::array<std::size_t, nlayers> offsets = [] {
     std::array<std::size_t, nlayers> o{};
     std::size_t acc = 0;
@@ -185,19 +186,19 @@ struct stack_meta {
     }
     return o;
   }();
-  static constexpr std::size_t header_size = (std::size_t{0} + ... + nanom::wire_size_v<L>);
+  static constexpr std::size_t header_size = (std::size_t{0} + ... + nanom::wire_size_v<wire_t<L>>);
   static_assert(header_size < 0xffff, "nanocraft: header image too large");
   static constexpr std::array<std::string_view, nlayers> names{std::string_view(layer_info<L>::name)...};
   static constexpr std::array<bool, nlayers> is_ip{has_pseudo<L>()...};
   static constexpr std::array<pseudo_spec, nlayers> pseudos{pseudo_of<L>()...};
-  static constexpr std::size_t nfields = (std::size_t{0} + ... + nanom::detail::field_count_v<L>);
+  static constexpr std::size_t nfields = (std::size_t{0} + ... + nanom::detail::field_count_v<wire_t<L>>);
 
   static constexpr std::array<field_desc, nfields> fields = [] {
     std::array<field_desc, nfields> out{};
     std::size_t k = 0, li = 0;
     (
         [&] {
-          using T = L;
+          using T = wire_t<L>;
           constexpr auto offs = nanom::detail::field_bit_offsets<T>();
           std::uint16_t occ = 0;
           for (std::size_t j = 0; j < li; ++j)
@@ -626,20 +627,26 @@ class frame_template {
   explicit frame_template(const stack<L...>& s, const template_options& o = {}) : opts_(o) {
     auto layers = s.layers;
     detail::link_all(layers);
+    std::array<bool, slot_count ? slot_count : 1> keep{};
     [&]<std::size_t... I>(std::index_sequence<I...>) {
       (
           [&] {
             if (!error_.empty()) return;
-            auto r = nanom::emit(std::get<I>(layers), std::span<std::byte>(img_.data() + meta::offsets[I], meta::sizes[I]),
-                                 {}, std::endian::big);
-            if (!r) error_ = r.error().what;
+            error_ = detail::write_layer<I>(layers, img_.data(), meta::offsets[I], header_size);
+            if constexpr (requires(const std::tuple_element_t<I, std::tuple<L...>>& l) {
+                            { layer_info<std::tuple_element_t<I, std::tuple<L...>>>::keep_checksum(l) } -> std::convertible_to<bool>;
+                          }) {
+              if (layer_info<std::tuple_element_t<I, std::tuple<L...>>>::keep_checksum(std::get<I>(layers)))
+                for (std::size_t k = 0; k < slot_count; ++k)
+                  if (meta::fields[meta::slots[k].field].layer_index == I) keep[k] = true;
+            }
           }(),
           ...);
     }(std::make_index_sequence<sizeof...(L)>{});
     for (std::size_t k = 0; k < slot_count; ++k) {
       user_csum_[k] = detail::load16(img_.data() + meta::slots[k].off);
-      policy_[k] = csum_policy::compute;
-      mode_[k] = detail::mode_checksum;
+      policy_[k] = keep[k] ? csum_policy::keep : csum_policy::compute;
+      mode_[k] = keep[k] ? detail::mode_skip : detail::mode_checksum;
     }
     cur_payload_ = o.payload_size;
     for (const auto& l : meta::lengths) detail::write_field(img_.data(), meta::fields[l.field], length_value(l, cur_payload_));
@@ -734,6 +741,23 @@ class frame_template {
   NANOCRAFT_INLINE void payload_size(std::size_t n) noexcept {
     if (n == cur_payload_) return;
     for (const auto& l : meta::lengths) set(field_id{l.field}, length_value(l, n));
+    // L4 checksums whose pseudo-header length is not a field of the frame (TCP): incremental too.
+    [&]<std::size_t... K>(std::index_sequence<K...>) {
+      (
+          [&] {
+            constexpr slot_desc s = meta::slots[K];
+            if constexpr (s.kind == checksum_kind::l4 && s.alias < 0) {
+              if (mode_[K] == detail::mode_skip) return;
+              const std::uint32_t a = std::uint32_t(header_size + cur_payload_ - s.cover.begin);
+              const std::uint32_t b = std::uint32_t(header_size + n - s.cover.begin);
+              const std::uint32_t os = (a >> 16) + (a & 0xffff), ns = (b >> 16) + (b & 0xffff);
+              std::byte* cp = img_.data() + s.off;
+              detail::store16(cp, mode_[K] == detail::mode_checksum ? csum::update(detail::load16(cp), os, ns)
+                                                                    : csum::update_sum(detail::load16(cp), os, ns));
+            }
+          }(),
+          ...);
+    }(std::make_index_sequence<slot_count>{});
     cur_payload_ = n;
   }
   /// Does a frame with an n-byte payload fit `room` bytes? (Overflow-safe.)

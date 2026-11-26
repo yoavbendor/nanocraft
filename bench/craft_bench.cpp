@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // nanocraft benchmarks. Usage: craft_bench [case|all] [frames]
 //
-//   emit        nanom emit<> per layer, Eth/VLAN/IPv4/UDP/SOME-IP + 32 B payload (the baseline)
+//   emit        nanowire::build_frame per frame, Eth/VLAN/IPv4/UDP/SOME-IP + 32 B payload (the baseline)
 //   tmpl1/3/5   compiled template, 1/3/5 patched fields + 32 B payload, UDP checksum zero
 //   tmpl3c      same as tmpl3 with the UDP checksum computed (payload summed)
 //   tmpl3d      tmpl3, but the 3 fields are patched in the written frame (t.patch<>(frame, v))
@@ -15,7 +15,7 @@
 // template frames are byte-identical to the emit baseline.
 #include <nanocraft/nanocraft.hpp>
 
-#include <nanom/emit.hpp>
+#include <nanowire/build.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -25,28 +25,9 @@
 #include <vector>
 
 using namespace nanocraft::proto;
-namespace nm = nanom;
 using clk = std::chrono::steady_clock;
 
-static std::uint16_t csum16(std::span<const std::byte> b) { return nanocraft::csum::finish(nanocraft::csum::sum(b)); }
-template <>
-struct nm::computed<ipv4> {
-  static constexpr auto fields = std::tuple{
-      nm::calc<"total_length">([](const ipv4&, const nm::emit_ctx& c) { return 20 + c.payload.size(); }),
-      nm::checksum<"checksum">([](std::span<const std::byte> h, const nm::emit_ctx&) { return csum16(h); })};
-};
-template <>
-struct nm::computed<udp> {
-  static constexpr auto fields =
-      std::tuple{nm::calc<"length">([](const udp&, const nm::emit_ctx& c) { return 8 + c.payload.size(); })};
-};
-template <>
-struct nm::computed<someip> {
-  static constexpr auto fields =
-      std::tuple{nm::calc<"length">([](const someip&, const nm::emit_ctx& c) { return 8 + c.payload.size(); })};
-};
-
-constexpr std::size_t kPay = 32, kFrame = 14 + 4 + 20 + 8 + 16 + kPay;
+constexpr std::size_t kPay = 32;
 static int reps() {
   const char* e = std::getenv("NANOCRAFT_BENCH_REPS");
   return e ? std::max(1, std::atoi(e)) : 5;
@@ -67,49 +48,35 @@ static double best_ns(long n, F&& f) {
 }
 
 static const eth kEth{.dst = {1, 0x80, 0xc2, 0, 0, 1}, .src = {2, 0, 0, 0, 0xaa, 1}};
-static const vlan kVlan{.pcp = {3}, .vid = {100}};
+static const vlan kVlan{.vid = 100, .pcp = 3};
 static const ipv4 kIp{.src = {10, 0, 0, 1}, .dst = {10, 0, 0, 2}};
 static const udp kUdp{.src_port = 30501, .dst_port = 30501};
-static const someip kSomeip{.service_id = 0x1234, .method_id = 0x8001, .client_id = 1};
+static const someip kSomeip{.service_id = 0x1234, .method_id = 0x8001, .client_id = 1, .session_id = 0};
 
 static volatile std::uint64_t g_sink;
 
+// The baseline: nanowire's builders write every layer of every frame (nanowire::build_frame:
+// lengths derived, IPv4 header checksum computed; UDP checksum 0 = none, like the templates).
 static void bench_emit(long n, std::uint64_t* hash) {
-  std::vector<std::byte> buf(256);
+  std::array<std::byte, 256> buf{};
   std::byte pay[kPay];
   const double ns = best_ns(n, [&](int r) {
     std::uint64_t h = 1469598103934665603ull;
     for (long i = 0; i < n; ++i) {
       std::memset(pay, int(i & 0xff), kPay);
-      std::byte* end = buf.data() + buf.size();
-      std::byte* p = end - kPay;
-      std::memcpy(p, pay, kPay);
       someip s = kSomeip;
       s.session_id = std::uint16_t(i);
-      p -= 16;
-      (void)nm::emit(s, {p, 16}, nm::emit_ctx{{p + 16, kPay}}, std::endian::big);
-      udp u = kUdp;
-      p -= 8;
-      (void)nm::emit(u, {p, 8}, nm::emit_ctx{{p + 8, std::size_t(end - p - 8)}}, std::endian::big);
       ipv4 ip = kIp;
-      ip.identification = std::uint16_t(i);
-      ip.protocol = 17;
-      p -= 20;
-      (void)nm::emit(ip, {p, 20}, nm::emit_ctx{{p + 20, std::size_t(end - p - 20)}}, std::endian::big);
-      vlan v = kVlan;
-      v.ethertype = 0x0800;
-      p -= 4;
-      (void)nm::emit(v, {p, 4}, {}, std::endian::big);
-      eth e = kEth;
-      e.ethertype = 0x8100;
-      p -= 14;
-      (void)nm::emit(e, {p, 14}, {}, std::endian::big);
-      if (r == 0 && hash) h = fnv(p, kFrame, h);
-      g_sink = g_sink + std::uint8_t(p[30]);
+      ip.id = std::uint16_t(i);
+      udp u = kUdp;
+      u.checksum = 0;
+      const auto f = nanowire::build_frame(buf, kEth, kVlan, ip, u, s, nanowire::raw{{pay, kPay}});
+      if (r == 0 && hash) h = fnv(buf.data(), f->size, h);
+      g_sink = g_sink + std::uint8_t(buf[30]);
     }
     if (r == 0 && hash) *hash = h;
   });
-  std::printf("emit        nanom emit<> per layer          %7.2f ns/frame\n", ns);
+  std::printf("emit        nanowire build_frame            %7.2f ns/frame\n", ns);
 }
 
 static void bench_tmpl(long n, int patches, bool udp_csum, std::uint64_t* hash) {
@@ -250,7 +217,7 @@ int main(int argc, char** argv) {
   std::uint64_t hd = 0;
   if (all || which == "tmpl3d") bench_tmpl_dst(n, all ? &hd : nullptr);
   if (all)
-    std::printf("template frames byte-identical to the nanom emit baseline: %s\n", ha == hb && ha == hd ? "yes" : "NO");
+    std::printf("template frames byte-identical to the nanowire build_frame baseline: %s\n", ha == hb && ha == hd ? "yes" : "NO");
   if (all || which == "pcap") bench_pcap(n, false);
   if (all || which == "pcapng") bench_pcap(n, true);
   const long nm_ = all ? std::max(1L, n / 1000) : n;

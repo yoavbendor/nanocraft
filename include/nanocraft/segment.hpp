@@ -17,7 +17,7 @@
 //
 // Each gather is [replicated headers in the arena][slice of template tail][slice of payload]; the
 // arena and payload must outlive the gathers (the arena is reused by the next call). Presets for
-// the stub protocols live in nanocraft/detail/proto_stub.hpp (ipv4_fragments, ipv6_fragments,
+// nanowire's protocols live in nanocraft/nanowire_layers.hpp (ipv4_fragments, ipv6_fragments,
 // someip_tp_segments).
 #ifndef NANOCRAFT_SEGMENT_HPP_INCLUDED
 #define NANOCRAFT_SEGMENT_HPP_INCLUDED
@@ -102,6 +102,16 @@ class segmenter {
       std::memcpy(h, full_.data(), rep_);
       for (const auto& l : meta::lengths)
         if (meta::fields[l.field].off < rep_) t.patch(h, field_id{l.field}, tmpl::length_for_end(l, rep_ + len), head_mask_);
+      // L4 checksums in the replicated headers without a length field (TCP): pseudo-header length
+      for (std::size_t s = 0; s < meta::nslots; ++s) {
+        const auto& sl = meta::slots[s];
+        if (sl.kind != checksum_kind::l4 || sl.alias >= 0 || !((head_mask_ >> s) & 1) || t.slot_mode(s) == detail::mode_skip)
+          continue;
+        const std::uint32_t a = std::uint32_t(H + n - sl.cover.begin), b = std::uint32_t(rep_ + len - sl.cover.begin);
+        const std::uint32_t os = (a >> 16) + (a & 0xffff), ns = (b >> 16) + (b & 0xffff);
+        const std::uint16_t c = detail::load16(h + sl.off);
+        detail::store16(h + sl.off, t.slot_mode(s) == detail::mode_checksum ? csum::update(c, os, ns) : csum::update_sum(c, os, ns));
+      }
       t.patch(h, off_, o / spec_.unit, head_mask_);
       const std::uint64_t mv = detail::read_field(h, meta::fields[more_.index]);
       t.patch(h, more_, k + 1 < nseg ? (mv | spec_.more_bit) : (mv & ~spec_.more_bit), head_mask_);

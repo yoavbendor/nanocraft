@@ -1,33 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // nanocraft/layer.hpp — the protocol seam: what the crafting engine needs to know about a layer.
 //
-// A layer is a fixed-size header struct registered with NANOM_DESCRIBE (its wire image is exactly
-// what nanom::emit writes) plus a nanocraft::layer_info<L> specialization that tells the engine,
-// declaratively, which of its fields are lengths, which are Internet checksums, and how it links to
-// the layer stacked on top of it. The engine (frame_template.hpp) is protocol-independent: it only
-// ever reads this table.
+// A layer is a fixed-size header with a NANOM_DESCRIBE'd wire layout plus a
+// nanocraft::layer_info<L> specialization that tells the engine, declaratively, which of its
+// fields are lengths, which are Internet checksums, and how it links to the layer stacked on top
+// of it. The engine (frame_template.hpp) is protocol-independent: it only ever reads this table.
+// Two kinds of layer value are accepted:
+//
+//   * a described wire struct itself (`L` is nanom::Described): the image is nanom::emit(L), the
+//     patch points are L's fields;
+//   * a builder value (nanowire::ipv4{...}, ...): layer_info<L>::wire names the described wire
+//     struct that gives the patch points, and the image is what the builder itself writes
+//     (`layer_info<L>::write(l, p, ctx)` if given, else `l.write(p, ctx)` / `l.write(p)`, with a
+//     nanowire::build_ctx). The builder must write exactly wire_size_v<wire> bytes.
 //
 //   template <> struct nanocraft::layer_info<my_hdr> {
 //     static constexpr std::string_view name = "my";                       // patch path prefix
+//     using wire = my_wire_hdr;                                             // builders only
 //     static constexpr std::array lengths   = {length_spec{"len", 0, 0}};   // optional
 //     static constexpr std::array checksums = {checksum_spec{"ck", checksum_kind::header}};  // optional
 //     static constexpr pseudo_spec pseudo{...};                             // optional: an IP layer
 //     static constexpr std::array selectors = {std::string_view{"type"}};  // optional: identity fields
-//     template <class Next> static constexpr void link(my_hdr&, const Next&);  // optional
+//     static constexpr std::uint16_t ethertype = 0x88b5;  // optional: announced to the layer below
+//     static constexpr std::uint8_t ip_proto = 253;       // optional: announced to the layer below
+//     template <class Next> static constexpr void link(my_hdr&, const Next&);    // optional
+//     static constexpr std::string_view check(const my_hdr&);   // optional: "" or why it cannot be templated
+//     static constexpr bool keep_checksum(const my_hdr&);       // optional: start with csum_policy::keep
 //   };
 //
 // Stacks are written with operator/ (`eth{} / ipv4{} / udp{}`) or nanocraft::stack{...}.
-//
-// nanowire (the protocol-definition library) will provide these specializations for its builders;
-// until then nanocraft/detail/proto_stub.hpp provides a minimal set.
+// nanocraft/nanowire_layers.hpp specializes layer_info for nanowire's builders and wire structs.
 #ifndef NANOCRAFT_LAYER_HPP_INCLUDED
 #define NANOCRAFT_LAYER_HPP_INCLUDED
 
 #include <nanom/emit.hpp>
+#include <nanowire/core.hpp>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
@@ -68,11 +80,43 @@ struct pseudo_spec {
 template <class L>
 struct layer_info;
 
+namespace detail {
+template <class L>
+struct wire_of {
+  using type = L;
+};
+template <class L>
+  requires requires { typename layer_info<L>::wire; }
+struct wire_of<L> {
+  using type = typename layer_info<L>::wire;
+};
+}  // namespace detail
+
+/// The described wire struct that gives layer L its byte layout and patch points.
+template <class L>
+using wire_t = typename detail::wire_of<L>::type;
+
 template <class L>
 concept layer = requires {
   { layer_info<L>::name } -> std::convertible_to<std::string_view>;
-  requires nanom::Described<L>;
+  requires nanom::Described<wire_t<L>>;
 };
+
+/// The EtherType layer `n` announces to the layer below it (0: none). A builder's ethertype()
+/// (nanowire::vlan returns its TPID) wins over layer_info<N>::ethertype.
+template <class N>
+constexpr std::uint16_t next_ethertype(const N& n) noexcept {
+  if constexpr (requires { n.ethertype(); }) return std::uint16_t(n.ethertype());
+  else if constexpr (requires { layer_info<N>::ethertype; }) return layer_info<N>::ethertype;
+  else return 0;
+}
+/// The IP protocol number layer `n` announces to the IP / extension header below it (0: none).
+template <class N>
+constexpr std::uint8_t next_ip_proto(const N& n) noexcept {
+  if constexpr (requires { n.ip_protocol(); }) return std::uint8_t(n.ip_protocol());
+  else if constexpr (requires { layer_info<N>::ip_proto; }) return layer_info<N>::ip_proto;
+  else return 0;
+}
 
 /// A list of layers, outermost first.
 template <layer... L>
@@ -112,6 +156,44 @@ template <class L> constexpr bool has_pseudo() { return requires { layer_info<L>
 template <class L> constexpr pseudo_spec pseudo_of() {
   if constexpr (has_pseudo<L>()) return layer_info<L>::pseudo;
   else return {};
+}
+/// Encode layer I of a (linked) stack into the header image at `off` (`total` = header image
+/// size). Returns "" or why the layer cannot be templated.
+template <std::size_t I, class... L>
+constexpr std::string_view write_layer(const std::tuple<L...>& t, std::byte* img, std::size_t off, std::size_t total) {
+  using T = std::tuple_element_t<I, std::tuple<L...>>;
+  using W = wire_t<T>;
+  constexpr std::size_t n = nanom::wire_size_v<W>;
+  const T& l = std::get<I>(t);
+  if constexpr (requires { layer_info<T>::check(l); }) {
+    const std::string_view e = layer_info<T>::check(l);
+    if (!e.empty()) return e;
+  }
+  if constexpr (std::is_same_v<W, T>) {
+    auto r = nanom::emit(l, std::span<std::byte>(img + off, n), {}, std::endian::big);
+    if (!r) return r.error().what;
+  } else {
+    if constexpr (requires { l.size(); })
+      if (std::size_t(l.size()) != n)
+        return "nanocraft: layer value is not fixed-size (IP / TCP options, someip{.tp}?): templates need fixed-size "
+               "layers";
+    nanowire::build_ctx c{};
+    c.after = total - off - n;
+    c.frame = img;
+    if constexpr (I + 1 < sizeof...(L)) {
+      using N = std::tuple_element_t<I + 1, std::tuple<L...>>;
+      const N& nx = std::get<I + 1>(t);
+      c.next_ethertype = next_ethertype(nx);
+      c.next_ip_proto = next_ip_proto(nx);
+      c.has_next_ip_proto = requires { nx.ip_protocol(); } || requires { layer_info<N>::ip_proto; };
+    }
+    bool ok;
+    if constexpr (requires { layer_info<T>::write(l, img + off, c); }) ok = layer_info<T>::write(l, img + off, c);
+    else if constexpr (requires { l.write(img + off, c); }) ok = l.write(img + off, c);
+    else ok = l.write(img + off);
+    if (!ok) return "nanocraft: a layer field value does not fit its wire field (the builder refused it)";
+  }
+  return {};
 }
 /// Run layer_info<A>::link(a, b) for every adjacent pair (fills next-protocol fields left at 0).
 template <class... L>

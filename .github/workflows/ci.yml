@@ -27,7 +27,7 @@ jobs:
       - name: Python oracle modules (dpkt, scapy)
         run: python3 -m pip install --user dpkt scapy
 
-      - name: Configure (nanom via FetchContent, pinned)
+      - name: Configure (nanowire + nanom via FetchContent, pinned)
         run: >
           cmake -S . -B build
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
@@ -35,6 +35,11 @@ jobs:
           -DNANOCRAFT_SANITIZER=${{ matrix.sanitizer }}
           -DNANOCRAFT_WERROR=${{ matrix.werror }}
           -DNANOCRAFT_PROFILE=${{ matrix.profile || 'OFF' }}
+
+      - name: One nanom only (nanowire shares nanocraft's)
+        run: |
+          test -d build/_deps/nanowire-src
+          test "$(ls -d build/_deps/nanom*-src | wc -l)" = 1
 
       - name: Build
         run: cmake --build build -j4

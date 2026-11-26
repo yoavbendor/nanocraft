@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// nanocraft/nanocraft.hpp — umbrella header: everything, plus the stub protocol layers.
+// nanocraft/nanocraft.hpp — umbrella header: everything, plus nanowire's protocols as layers.
 //
 //   checksum.hpp        Internet checksum + RFC 1624 incremental update
 //   layer.hpp           the protocol seam (layer_info<L>, stack, operator/)
@@ -11,7 +11,8 @@
 //   replay.hpp          replay a capture with rewriting and original / scaled timing
 //   linux_tx.hpp        AF_PACKET TX ring, sendmmsg, SO_TXTIME (Linux only)
 //   profile.hpp         NANOCRAFT_PROFILE counters
-//   detail/proto_stub.hpp  eth/vlan/ipv4/ipv6/ipv6_frag/udp/someip/someip_tp (to be replaced by nanowire)
+//   nanowire_layers.hpp layer_info for nanowire's builders / wire structs, nanocraft::proto names,
+//                       segmentation presets (ipv4_fragments, ipv6_fragments, someip_tp_segments)
 #ifndef NANOCRAFT_NANOCRAFT_HPP_INCLUDED
 #define NANOCRAFT_NANOCRAFT_HPP_INCLUDED
 
@@ -26,7 +27,7 @@
 #include "replay.hpp"
 #include "segment.hpp"
 
-#include "detail/proto_stub.hpp"
+#include "nanowire_layers.hpp"
 
 #define NANOCRAFT_VERSION_MAJOR 0
 #define NANOCRAFT_VERSION_MINOR 1
