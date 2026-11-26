@@ -1,0 +1,8 @@
+build*/
+.deps*/
+cmake-build-*/
+compile_commands.json
+.cache/
+*.pcap
+*.pcapng
+callgrind.out.*
