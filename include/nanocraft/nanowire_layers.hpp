@@ -153,7 +153,7 @@ struct layer_info<nanowire::ipv4> {
   static constexpr std::array lengths{length_spec{"total_length", 0, 0}};
   static constexpr std::array checksums{checksum_spec{"checksum", checksum_kind::header, 20}};
   static constexpr pseudo_spec pseudo{12, 8, true};
-  static constexpr std::array<std::string_view, 3> selectors{"version", "ihl", "protocol"};
+  static constexpr std::array<std::string_view, 4> selectors{"version", "ihl", "frag_offset", "protocol"};
   static constexpr std::string_view check(const nanowire::ipv4& l) { return l.total_length ? nwl::length_override : ""; }
   static constexpr bool keep_checksum(const nanowire::ipv4& l) { return l.checksum.has_value(); }
 };
@@ -180,7 +180,7 @@ struct layer_info<nanowire::udp> {
   static constexpr std::string_view name = "udp";
   using wire = nanowire::wire::udp_hdr;
   static constexpr std::array lengths{length_spec{"length", 0, 0}};
-  static constexpr std::array checksums{checksum_spec{"checksum", checksum_kind::l4, 0, 17, "length"}};
+  static constexpr std::array checksums{checksum_spec{"checksum", checksum_kind::l4, 0, 17, "length", true}};
   static constexpr std::string_view check(const nanowire::udp& l) { return l.length ? nwl::length_override : ""; }
   static constexpr bool keep_checksum(const nanowire::udp& l) { return l.checksum.has_value(); }
 };
@@ -189,7 +189,8 @@ struct layer_info<nanowire::tcp> {
   static constexpr std::string_view name = "tcp";
   using wire = nanowire::wire::tcp_hdr;
   // No length field: the pseudo header's TCP length follows the payload size (frame_template).
-  static constexpr std::array checksums{checksum_spec{"checksum", checksum_kind::l4, 0, 6, {}}};
+  static constexpr std::array checksums{checksum_spec{"checksum", checksum_kind::l4, 0, 6, {}, false}};
+  static constexpr std::array<std::string_view, 1> selectors{"data_offset"};
   static constexpr bool keep_checksum(const nanowire::tcp& l) { return l.checksum.has_value(); }
 };
 

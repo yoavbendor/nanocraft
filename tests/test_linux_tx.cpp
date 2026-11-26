@@ -183,8 +183,75 @@ static bool live_tests() {
   return true;
 }
 
+static void test_tx_edge_cases() {
+  // Default / invalid tx_ring_view guards
+  {
+    nanocraft::tx_ring_view empty;
+    CHECK_EQ(empty.max_frame(), std::size_t(0));
+    CHECK(empty.acquire(0).empty());
+    CHECK(empty.acquire(10).empty());
+    std::array<std::byte, 4> d{};
+    CHECK(!empty.write(d));
+
+    std::array<std::byte, 64> small_mem{};
+    nanocraft::tx_ring_view tiny(small_mem.data(), 16, 4);
+    CHECK_EQ(tiny.max_frame(), std::size_t(0));
+    CHECK(tiny.acquire(0).empty());
+
+    nanocraft::tx_ring_view zero_n(small_mem.data(), 2048, 0);
+    CHECK_EQ(zero_n.max_frame(), std::size_t(0));
+    CHECK(zero_n.acquire(0).empty());
+  }
+  // tx_ring_view::write(tmpl, pay) rejects !tmpl.ok() without committing
+  {
+    constexpr std::size_t fs = 2048, n = 4;
+    std::vector<std::byte> mem(fs * n + 64);
+    auto* base = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(mem.data()) + 63) & ~std::uintptr_t(63));
+    nanocraft::tx_ring_view ring(base, fs, n);
+    auto bad = nanocraft::compile(eth{} / ipv4{.total_length = 99} / udp{});
+    CHECK(!bad.ok());
+    std::array<std::byte, 8> pay{};
+    CHECK(!ring.write(bad, pay));
+    CHECK_EQ(ring.cursor(), std::size_t(0));
+    CHECK_EQ(ring.take_pending(), std::size_t(0));
+    // Empty span with nullptr data writes cleanly without memcpy UB
+    CHECK(ring.write(std::span<const std::byte>(static_cast<const std::byte*>(nullptr), 0)));
+    CHECK_EQ(ring.cursor(), std::size_t(1));
+  }
+  // tx_ring::open validates options before touching socket
+  {
+    auto r1 = nanocraft::tx_ring::open("lo", {.frame_size = 16, .frame_count = 4});
+    CHECK(!r1);
+    CHECK_EQ(r1.err, EINVAL);
+    auto r2 = nanocraft::tx_ring::open("lo", {.frame_size = 2048, .frame_count = 0});
+    CHECK(!r2);
+    CHECK_EQ(r2.err, EINVAL);
+    auto r3 = nanocraft::tx_ring::open("lo", {.frame_size = std::size_t(1) << 33, .frame_count = 4});
+    CHECK(!r3);
+    CHECK_EQ(r3.err, EINVAL);
+  }
+  // mmsg_sender: non-copyable/non-movable, clamped dst_len, aligned cmsg, empty gather, error flush
+  {
+    static_assert(!std::is_copy_constructible_v<nanocraft::mmsg_sender>);
+    static_assert(!std::is_move_constructible_v<nanocraft::mmsg_sender>);
+    nanocraft::mmsg_sender tx(-1, 4);
+    tx.set_destination(nullptr, 100);
+    sockaddr_storage ss{};
+    tx.set_destination(&ss, socklen_t(sizeof(ss) + 64));  // clamped safely
+    nanocraft::gather empty_g;
+    CHECK(tx.add(empty_g));  // 0 chunks -> no memcpy UB
+    std::array<std::byte, 8> frame{};
+    CHECK(tx.add(frame, std::uint64_t{123456789}));  // exercises alignas(cmsghdr) cmsg_slot under UBSan
+    CHECK_EQ(tx.queued(), std::size_t(2));
+    CHECK(tx.flush() < 0);  // EBADF on fd = -1
+    CHECK_EQ(tx.queued(), std::size_t(0));
+    CHECK_EQ(tx.sent(), std::uint64_t(0));
+  }
+}
+
 int main() {
   test_ring_view();
+  test_tx_edge_cases();
   live_tests();
   return t::done("test_linux_tx");
 }

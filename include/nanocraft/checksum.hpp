@@ -10,15 +10,14 @@
 // must be byte-swapped before it is combined (swap()); sum() of a span always starts at an even
 // position. All functions are constexpr and allocation-free; sum() reads 8 bytes per step.
 //
-// nanom is gaining include/nanom/checksum.hpp with the same primitives; once a nanom release with
-// it is pinned, this header becomes a thin forwarding layer.
+// Thin forwarding layer over <nanom/checksum.hpp> (nanom::inet::*).
 #ifndef NANOCRAFT_CHECKSUM_HPP_INCLUDED
 #define NANOCRAFT_CHECKSUM_HPP_INCLUDED
 
-#include <bit>
+#include <nanom/checksum.hpp>
+
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <span>
 
 namespace nanocraft::csum {
@@ -27,7 +26,6 @@ namespace nanocraft::csum {
 constexpr std::uint16_t fold(std::uint64_t s) noexcept {
   s = (s & 0xffffffffu) + (s >> 32);
   s = (s & 0xffffffffu) + (s >> 32);
-  s = (s & 0xffffu) + (s >> 16);
   s = (s & 0xffffu) + (s >> 16);
   s = (s & 0xffffu) + (s >> 16);
   return std::uint16_t(s);
@@ -43,62 +41,23 @@ constexpr std::uint16_t swap(std::uint32_t s) noexcept {
 }
 
 /// The value to store in a checksum field for a stream whose partial sum is s.
-constexpr std::uint16_t finish(std::uint32_t s) noexcept { return std::uint16_t(~fold(s)); }
+constexpr std::uint16_t finish(std::uint32_t s) noexcept { return nanom::inet::sum{}.add_folded(fold(s)).checksum(); }
 
 /// Partial ones'-complement sum of n bytes as big-endian 16-bit words (a trailing odd byte is the
 /// high half of a zero-padded word).
-constexpr std::uint32_t sum(const std::byte* p, std::size_t n) noexcept {
-  if consteval {
-    std::uint64_t s = 0;
-    std::size_t i = 0;
-    for (; i + 1 < n; i += 2) s += (std::uint32_t(std::uint8_t(p[i])) << 8) | std::uint8_t(p[i + 1]);
-    if (i < n) s += std::uint32_t(std::uint8_t(p[i])) << 8;
-    return fold(s);
-  } else {
-    // Native-order accumulation: the ones'-complement sum is byte-order independent, so sum the
-    // words as the host sees them and swap once at the end on little-endian hosts.
-    std::uint64_t acc = 0;
-    std::size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-      std::uint64_t w;
-      std::memcpy(&w, p + i, 8);
-      acc += (w & 0xffffffffu) + (w >> 32);
-    }
-    if (i + 4 <= n) {
-      std::uint32_t w;
-      std::memcpy(&w, p + i, 4);
-      acc += w;
-      i += 4;
-    }
-    if (i + 2 <= n) {
-      std::uint16_t w;
-      std::memcpy(&w, p + i, 2);
-      acc += w;
-      i += 2;
-    }
-    if (i < n) {
-      // the odd byte is the high (first) byte of its big-endian word
-      if constexpr (std::endian::native == std::endian::little) acc += std::uint8_t(p[i]);
-      else acc += std::uint32_t(std::uint8_t(p[i])) << 8;
-    }
-    std::uint16_t f = fold(acc);
-    if constexpr (std::endian::native == std::endian::little) f = std::uint16_t((f << 8) | (f >> 8));
-    return f;
-  }
-}
-constexpr std::uint32_t sum(std::span<const std::byte> b) noexcept { return sum(b.data(), b.size()); }
+constexpr std::uint32_t sum(std::span<const std::byte> b) noexcept { return nanom::inet::sum{}.add(b).folded(); }
+constexpr std::uint32_t sum(const std::byte* p, std::size_t n) noexcept { return sum(std::span<const std::byte>(p, n)); }
 
 /// RFC 1624 eqn. 3: the stored checksum hc after 16-bit-word content with partial sum `old_sum`
 /// became `new_sum`. Never produces the -0 artefact of eqn. 2.
 constexpr std::uint16_t update(std::uint16_t hc, std::uint32_t old_sum, std::uint32_t new_sum) noexcept {
-  const std::uint32_t s = std::uint32_t(std::uint16_t(~hc)) + std::uint16_t(~fold(old_sum)) + fold(new_sum);
-  return std::uint16_t(~fold(s));
+  return nanom::inet::update16(hc, fold(old_sum), fold(new_sum));
 }
 
 /// Same update for a field that stores the folded sum itself (not complemented): the pseudo-header
 /// seed of a checksum offloaded to the NIC (CHECKSUM_PARTIAL).
 constexpr std::uint16_t update_sum(std::uint16_t stored, std::uint32_t old_sum, std::uint32_t new_sum) noexcept {
-  return fold(std::uint32_t(stored) + std::uint16_t(~fold(old_sum)) + fold(new_sum));
+  return std::uint16_t(~nanom::inet::update16(std::uint16_t(~stored), fold(old_sum), fold(new_sum)));
 }
 
 }  // namespace nanocraft::csum

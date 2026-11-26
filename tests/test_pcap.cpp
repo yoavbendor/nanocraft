@@ -290,6 +290,169 @@ static void test_snaplen() {
   CHECK(!r3.error().empty());
 }
 
+static void test_pcap_audit() {
+  // 1. write_buffer stays failed after output failure (reserve returns nullptr)
+  {
+    struct fail_sink {
+      int calls = 0;
+      bool fail_after = false;
+    } fs;
+    nanocraft::output out{&fs, [](void* c, const std::byte*, std::size_t) {
+                            auto* s = static_cast<fail_sink*>(c);
+                            ++s->calls;
+                            return !s->fail_after;
+                          }};
+    nanocraft::pcap_writer w(out, {.buffer_size = 64});
+    fs.fail_after = true;
+    std::array<std::byte, 48> f{};
+    // First write triggers flush of the 24-byte header -> fails!
+    CHECK(!w.write(1, f));
+    CHECK(!w.ok());
+    // Subsequent small write that would fit in an empty buffer MUST STILL FAIL!
+    std::array<std::byte, 4> small{};
+    CHECK(!w.write(2, small));
+    CHECK(w.begin(3, 4).empty());
+    CHECK(!w.ok());
+  }
+
+  // 2. pending_ invalidated by flush() / add_interface() and oversized end() rejected
+  {
+    std::vector<std::byte> file;
+    nanocraft::pcap_writer w(nanocraft::output::buffer(file));
+    CHECK(!w.begin(1, 16).empty());
+    CHECK(w.flush());
+    CHECK(!w.end(16));
+    CHECK(!w.begin(1, 16).empty());
+    CHECK(!w.end(32));  // > reserved
+    // Empty span with nullptr data
+    CHECK(w.write(1, std::span<const std::byte>(static_cast<const std::byte*>(nullptr), 0)));
+    // !ok() template rejected
+    auto bad = nanocraft::compile(eth{} / ipv4{.total_length = 99} / udp{});
+    CHECK(!w.write(2, bad, {}));
+  }
+  {
+    std::vector<std::byte> file;
+    nanocraft::pcapng_writer w(nanocraft::output::buffer(file));
+    const auto id = w.add_interface({.name = "eth0", .tsresol = 9});
+    CHECK_EQ(id, 0u);
+    // Reject unsupported tsresol (> 9 or binary flag 0x80)
+    CHECK_EQ(w.add_interface({.tsresol = 10}), ~0u);
+    CHECK_EQ(w.add_interface({.tsresol = 0x89}), ~0u);
+    // Reject option strings > 65535 bytes
+    std::string huge(70000, 'x');
+    CHECK_EQ(w.add_interface({.name = huge}), ~0u);
+    CHECK_EQ(w.add_interface({.description = huge}), ~0u);
+    CHECK(w.begin(id, 1, 16, {.comment = huge}).empty());
+    // add_interface / flush invalidate pending_
+    CHECK(!w.begin(id, 1, 16).empty());
+    CHECK_EQ(w.add_interface({.name = "eth1", .tsresol = 6}), 1u);
+    CHECK(!w.end(16));
+    CHECK(!w.begin(id, 1, 16).empty());
+    CHECK(w.flush());
+    CHECK(!w.end(16));
+    // Empty span with nullptr data & !ok() template
+    CHECK(w.write(id, 1, std::span<const std::byte>(static_cast<const std::byte*>(nullptr), 0)));
+    auto bad = nanocraft::compile(eth{} / ipv4{.total_length = 99} / udp{});
+    CHECK(!w.write(id, 2, bad, {}));
+  }
+  {
+    // Oversized userappl marks writer !ok()
+    std::vector<std::byte> file;
+    std::string huge(70000, 'u');
+    nanocraft::pcapng_writer w(nanocraft::output::buffer(file), 1024, huge);
+    CHECK(!w.ok());
+    CHECK_EQ(w.add_interface({}), ~0u);
+  }
+
+  // 3. capture_reader strictness: SHB total < 28, opt_endofopt len != 0, error reports block start b, EPB cap wrap
+  {
+    auto put32 = [](std::vector<std::byte>& v, std::uint32_t x) {
+      for (int i = 0; i < 4; ++i) v.push_back(std::byte((x >> (8 * i)) & 0xff));
+    };
+    auto put16 = [](std::vector<std::byte>& v, std::uint16_t x) {
+      v.push_back(std::byte(x & 0xff));
+      v.push_back(std::byte(x >> 8));
+    };
+
+    // Malformed SHB with total == 24 (< 28) inside a 32-byte buffer
+    std::vector<std::byte> short_shb;
+    put32(short_shb, 0x0a0d0d0au);  // type
+    put32(short_shb, 24);           // total < 28!
+    put32(short_shb, 0x1a2b3c4du);  // BOM
+    put16(short_shb, 1);            // major
+    put16(short_shb, 0);            // minor
+    put32(short_shb, 0xffffffffu);  // section len low
+    put32(short_shb, 24);           // trailing total == 24
+    put32(short_shb, 0);            // extra bytes so buffer >= 28
+    put32(short_shb, 0);
+    nanocraft::capture_reader r1(short_shb);
+    nanocraft::packet p;
+    CHECK(!r1.next(p));
+    CHECK(!r1.error().empty());
+    CHECK_EQ(r1.position(), std::size_t(0));
+
+    // Malformed opt_endofopt with len != 0 in IDB; verify error offset is block start (28)
+    std::vector<std::byte> bad_opt;
+    // Valid 28-byte SHB
+    put32(bad_opt, 0x0a0d0d0au);
+    put32(bad_opt, 28);
+    put32(bad_opt, 0x1a2b3c4du);
+    put16(bad_opt, 1);
+    put16(bad_opt, 0);
+    put32(bad_opt, 0xffffffffu);
+    put32(bad_opt, 0xffffffffu);
+    put32(bad_opt, 28);
+    // IDB starting at offset 28 with opt_endofopt (code=0, len=4)
+    const std::size_t idb_off = bad_opt.size();
+    put32(bad_opt, 1);   // IDB
+    put32(bad_opt, 24);  // total
+    put16(bad_opt, 1);   // linktype
+    put16(bad_opt, 0);   // reserved
+    put32(bad_opt, 0);   // snaplen
+    put16(bad_opt, 0);   // opt_endofopt
+    put16(bad_opt, 4);   // INVALID non-zero length!
+    put32(bad_opt, 24);  // trailing total
+    nanocraft::capture_reader r2(bad_opt);
+    CHECK(!r2.next(p));
+    CHECK(!r2.error().empty());
+    CHECK_EQ(r2.position(), idb_off);
+    CHECK(r2.error().find("offset 28") != std::string_view::npos);
+
+    // EPB with huge caplen (0xfffffffd) that would wrap 32-bit padding
+    std::vector<std::byte> bad_epb;
+    // Valid SHB (28 bytes)
+    put32(bad_epb, 0x0a0d0d0au);
+    put32(bad_epb, 28);
+    put32(bad_epb, 0x1a2b3c4du);
+    put16(bad_epb, 1);
+    put16(bad_epb, 0);
+    put32(bad_epb, 0xffffffffu);
+    put32(bad_epb, 0xffffffffu);
+    put32(bad_epb, 28);
+    // Valid IDB (20 bytes)
+    put32(bad_epb, 1);
+    put32(bad_epb, 20);
+    put16(bad_epb, 1);
+    put16(bad_epb, 0);
+    put32(bad_epb, 0);
+    put32(bad_epb, 20);
+    // EPB at offset 48 with cap = 0xfffffffd, orig = 0xfffffffd
+    const std::size_t epb_off = bad_epb.size();
+    put32(bad_epb, 6);
+    put32(bad_epb, 32);
+    put32(bad_epb, 0);
+    put32(bad_epb, 0);
+    put32(bad_epb, 0);
+    put32(bad_epb, 0xfffffffdu);
+    put32(bad_epb, 0xfffffffdu);
+    put32(bad_epb, 32);
+    nanocraft::capture_reader r3(bad_epb);
+    CHECK(!r3.next(p));
+    CHECK(!r3.error().empty());
+    CHECK_EQ(r3.position(), epb_off);
+  }
+}
+
 int main(int argc, char** argv) {
   const std::string dir = argc > 1 ? argv[1] : "";
   if (!dir.empty()) std::remove((dir + "/nanocraft_manifest.txt").c_str());
@@ -299,5 +462,6 @@ int main(int argc, char** argv) {
   test_pcapng(1 << 20, dir);
   test_pcapng(64, "");
   test_snaplen();
+  test_pcap_audit();
   return t::done("test_pcap");
 }

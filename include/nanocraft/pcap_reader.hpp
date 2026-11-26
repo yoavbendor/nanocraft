@@ -143,7 +143,10 @@ class capture_reader {
     while (b < e) {
       if (e - b < 4) return fail("truncated option header");
       const std::uint16_t code = rd16(b), len = rd16(b + 2);
-      if (code == 0) return true;  // opt_endofopt
+      if (code == 0) {
+        if (len != 0) return fail("opt_endofopt with non-zero length");
+        return true;  // opt_endofopt
+      }
       const std::size_t padded = (std::size_t(len) + 3) & ~std::size_t{3};
       if (padded > e - b - 4) return fail("option overruns its block");
       if (!fn(code, f_.subspan(b + 4, len))) return false;
@@ -171,13 +174,14 @@ class capture_reader {
       if (total > f_.size() - pos_) return fail("block overruns the file");
       if (rd32(pos_ + total - 4) != total) return fail("trailing block length differs");
       const std::size_t b = pos_, e = pos_ + total - 4;
-      pos_ += total;
       switch (type) {
         case 0x0a0d0d0au: {
+          if (total < 28) return fail("SHB too short");
           if (rd16(b + 12) != 1) return fail("SHB major version is not 1");
+          if (!options(b + 24, e, [](std::uint16_t, auto) { return true; })) return false;
           seen_shb_ = true;
           ifaces_.clear();
-          if (!options(b + 24, e, [](std::uint16_t, auto) { return true; })) return false;
+          pos_ += total;
           break;
         }
         case 1: {
@@ -203,6 +207,7 @@ class capture_reader {
           });
           if (!good) return false;
           ifaces_.push_back(itf);
+          pos_ += total;
           break;
         }
         case 6: {
@@ -211,8 +216,9 @@ class capture_reader {
                               orig = rd32(b + 24);
           if (id >= ifaces_.size()) return fail("EPB on an undeclared interface");
           if (cap > orig) return fail("EPB caplen > origlen");
-          const std::size_t dend = b + 28 + ((std::size_t(cap) + 3) & ~std::size_t{3});
-          if (dend > e) return fail("EPB data overruns its block");
+          const std::uint64_t padded_cap = (std::uint64_t(cap) + 3) & ~std::uint64_t{3};
+          if (padded_cap > e - (b + 28)) return fail("EPB data overruns its block");
+          const std::size_t dend = b + 28 + std::size_t(padded_cap);
           const auto& itf = ifaces_[id];
           p = packet{};
           const std::uint64_t ts = (std::uint64_t(hi) << 32) | lo;
@@ -234,6 +240,7 @@ class capture_reader {
             return true;
           });
           if (!good) return false;
+          pos_ += total;
           return true;
         }
         case 3: {
@@ -247,9 +254,12 @@ class capture_reader {
           p.linktype = ifaces_[0].linktype;
           p.origlen = orig;
           p.data = f_.subspan(b + 12, cap);
+          pos_ += total;
           return true;
         }
-        default: break;  // unknown block: skipped
+        default:
+          pos_ += total;
+          break;  // unknown block: skipped
       }
     }
   }

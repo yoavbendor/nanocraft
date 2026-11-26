@@ -488,6 +488,203 @@ static void test_tp_link() {
   CHECK_EQ(tx.get<"ipv4.protocol">(), 253u);
 }
 
+static void test_udp_vs_tcp_zero_checksum() {
+  // UDP over IPv4 and IPv6: computed 0x0000 must map to 0xFFFF across EVERY checksum path.
+  auto check_udp = [](auto&& tm, std::size_t udp_off) {
+    CHECK(tm.ok());
+    // 1. set<"udp.src_port"> (patch_ct) hitting 0x0000 -> 0xFFFF
+    tm.template set<"udp.src_port">(0);
+    tm.template set<"udp.dst_port">(1);
+    const std::uint16_t c0 = std::uint16_t(tm.template get<"udp.checksum">());
+    CHECK(c0 != 0 && c0 != 0xffff);
+    tm.template set<"udp.src_port">(c0);
+    CHECK_EQ(tm.template get<"udp.checksum">(), 0xffffu);
+    // Subsequent incremental update starting from mapped 0xFFFF must remain exact.
+    tm.template set<"udp.src_port">(std::uint16_t(c0 ^ 0x1234));
+    {
+      ref::bytes f(tm.frame_size(0));
+      CHECK_EQ(tm.write(f, {}), tm.header_size);
+      // Re-verify by recomputing from scratch via checksum() policy toggle.
+      const auto inc = tm.template get<"udp.checksum">();
+      CHECK(tm.checksum("udp.checksum", nanocraft::csum_policy::compute));
+      CHECK_EQ(inc, tm.template get<"udp.checksum">());
+    }
+    // 2. runtime set(field_id, ...) (patch_with) hitting 0x0000 -> 0xFFFF
+    tm.template set<"udp.src_port">(0);
+    const auto sp_id = tm.find("udp.src_port");
+    tm.set(sp_id, c0);
+    CHECK_EQ(tm.template get<"udp.checksum">(), 0xffffu);
+    // 3. recompute() hitting 0x0000 -> 0xFFFF
+    CHECK(tm.checksum("udp.checksum", nanocraft::csum_policy::compute));
+    CHECK_EQ(tm.template get<"udp.checksum">(), 0xffffu);
+    // 4. patch<"udp.src_port">(frame, ...) hitting 0x0000 -> 0xFFFF
+    tm.template set<"udp.src_port">(0);
+    ref::bytes f(tm.frame_size(0));
+    CHECK_EQ(tm.write(f, {}), tm.header_size);
+    tm.template patch<"udp.src_port">(f, c0);
+    CHECK_EQ(ref::get16(f, udp_off + 6), 0xffffu);
+    // 5. frame_ref::set<"udp.src_port"> hitting 0x0000 -> 0xFFFF
+    CHECK_EQ(tm.write(f, {}), tm.header_size);
+    nanocraft::frame_ref rf(tm, f);
+    rf.template set<"udp.src_port">(c0);
+    CHECK_EQ(ref::get16(f, udp_off + 6), 0xffffu);
+    // 6. commit() with payload hitting 0x0000 -> 0xFFFF
+    tm.payload_size(2);
+    tm.template set<"udp.src_port">(0);
+    const std::uint16_t c2 = std::uint16_t(tm.template get<"udp.checksum">());
+    const std::array<std::byte, 2> pay{std::byte(c2 >> 8), std::byte(c2 & 0xff)};
+    ref::bytes f2(tm.frame_size(2));
+    CHECK_EQ(tm.write(f2, pay), tm.header_size + 2);
+    CHECK_EQ(ref::get16(f2, udp_off + 6), 0xffffu);
+  };
+  check_udp(nanocraft::compile(eth{} / ipv4{.src = {10, 0, 0, 1}, .dst = {10, 0, 0, 2}} / udp{}), 14 + 20);
+  check_udp(nanocraft::compile(eth{} / ipv6{.src = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+                                            .dst = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}} /
+                               udp{}),
+            14 + 40);
+
+  // TCP over IPv4 and IPv6: computed 0x0000 MUST stay 0x0000 (NOT mapped to 0xFFFF).
+  auto check_tcp = [](auto&& tm, std::size_t tcp_off) {
+    CHECK(tm.ok());
+    // 1. set<"tcp.src_port"> (patch_ct) hitting 0x0000 stays 0x0000
+    tm.template set<"tcp.src_port">(0);
+    tm.template set<"tcp.dst_port">(1);
+    const std::uint16_t c0 = std::uint16_t(tm.template get<"tcp.checksum">());
+    CHECK(c0 != 0 && c0 != 0xffff);
+    tm.template set<"tcp.src_port">(c0);
+    CHECK_EQ(tm.template get<"tcp.checksum">(), 0x0000u);
+    // 2. runtime set(field_id, ...) (patch_with) hitting 0x0000 stays 0x0000
+    tm.template set<"tcp.src_port">(0);
+    tm.set(tm.find("tcp.src_port"), c0);
+    CHECK_EQ(tm.template get<"tcp.checksum">(), 0x0000u);
+    // 3. recompute() hitting 0x0000 stays 0x0000
+    CHECK(tm.checksum("tcp.checksum", nanocraft::csum_policy::compute));
+    CHECK_EQ(tm.template get<"tcp.checksum">(), 0x0000u);
+    // 4. patch<"tcp.src_port">(frame, ...) hitting 0x0000 stays 0x0000
+    tm.template set<"tcp.src_port">(0);
+    ref::bytes f(tm.frame_size(0));
+    CHECK_EQ(tm.write(f, {}), tm.header_size);
+    tm.template patch<"tcp.src_port">(f, c0);
+    CHECK_EQ(ref::get16(f, tcp_off + 16), 0x0000u);
+    // 5. frame_ref::set<"tcp.src_port"> hitting 0x0000 stays 0x0000 AND still updates FROM 0x0000
+    CHECK_EQ(tm.write(f, {}), tm.header_size);
+    nanocraft::frame_ref rf(tm, f);
+    rf.template set<"tcp.src_port">(c0);
+    CHECK_EQ(ref::get16(f, tcp_off + 16), 0x0000u);
+    rf.template set<"tcp.src_port">(0);
+    CHECK_EQ(ref::get16(f, tcp_off + 16), unsigned(c0));
+    // 6. commit() with payload hitting 0x0000 stays 0x0000
+    tm.payload_size(2);
+    tm.template set<"tcp.src_port">(0);
+    const std::uint16_t c2 = std::uint16_t(tm.template get<"tcp.checksum">());
+    const std::array<std::byte, 2> pay{std::byte(c2 >> 8), std::byte(c2 & 0xff)};
+    ref::bytes f2(tm.frame_size(2));
+    CHECK_EQ(tm.write(f2, pay), tm.header_size + 2);
+    CHECK_EQ(ref::get16(f2, tcp_off + 16), 0x0000u);
+    // 7. payload_size() incremental update hitting 0x0000 stays 0x0000
+    tm.payload_size(0);
+    tm.template set<"tcp.src_port">(nanocraft::csum::add(c0, 0xfffbu));  // +4 for payload_size(4) -> hits 0x0000
+    tm.payload_size(4);
+    CHECK_EQ(tm.template get<"tcp.checksum">(), 0x0000u);
+  };
+  check_tcp(nanocraft::compile(eth{} / ipv4{.src = {10, 0, 0, 1}, .dst = {10, 0, 0, 2}} / tcp{}), 14 + 20);
+  check_tcp(nanocraft::compile(eth{} / ipv6{.src = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+                                            .dst = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}} /
+                               tcp{}),
+            14 + 40);
+}
+
+static void test_audit_hardening() {
+  // 1. !ok() template rejected by write(), prepare(), commit()
+  auto bad = nanocraft::compile(eth{} / ipv4{.total_length = 99} / udp{});
+  CHECK(!bad.ok());
+  ref::bytes buf(128);
+  std::array<std::byte, 8> pay{};
+  CHECK(bad.prepare(buf, 8).empty());
+  CHECK_EQ(bad.write(buf, pay), std::size_t(0));
+  CHECK_EQ(bad.commit(buf, 8), std::size_t(0));
+
+  // 2. bad_checksum fault on UDPv4 never produces 0x0000 ("no checksum")
+  {
+    auto tm = nanocraft::compile(eth{} / ipv4{.src = {10, 0, 0, 1}, .dst = {10, 0, 0, 2}} / udp{});
+    tm.set<"udp.src_port">(0);
+    const std::uint16_t c0 = std::uint16_t(tm.get<"udp.checksum">());
+    // Set src_port so valid checksum becomes 0x5aa5 (which XOR 0x5aa5 would be 0x0000).
+    tm.set<"udp.src_port">(nanocraft::csum::add(c0, 0xa55au));
+    CHECK_EQ(tm.get<"udp.checksum">(), 0x5aa5u);
+    CHECK(tm.inject(nanocraft::faults{}.bad_checksum("udp.checksum")));
+    ref::bytes f(tm.frame_size(0));
+    CHECK_EQ(tm.write(f, {}), tm.header_size);
+    const std::uint16_t corrupted = ref::get16(f, 14 + 20 + 6);
+    CHECK(corrupted != 0x5aa5u);
+    CHECK(corrupted != 0x0000u);
+    CHECK_EQ(corrupted, 0x0001u);
+  }
+
+  // 3. faults overflow and empty field name rejected by inject()
+  {
+    auto tm = nanocraft::compile(eth{} / ipv4{} / udp{});
+    nanocraft::faults f;
+    for (int i = 0; i < 9; ++i) f.bad_checksum("ipv4.checksum");
+    CHECK(f.overflow);
+    CHECK(!tm.inject(f));
+    nanocraft::faults f2;
+    for (int i = 0; i < 9; ++i) f2.length_delta("udp.length", 1);
+    CHECK(f2.overflow);
+    CHECK(!tm.inject(f2));
+    CHECK(!tm.inject(nanocraft::faults{}.bad_checksum("")));
+    CHECK(!tm.inject(nanocraft::faults{}.length_delta("", 1)));
+  }
+
+  // 4. Empty brackets [] rejected by find() and layer()
+  {
+    auto tm = nanocraft::compile(eth{} / vlan{} / ipv4{} / udp{});
+    using M = decltype(tm)::meta;
+    static_assert(!decltype(tm)::find("vlan[].vid").valid());
+    static_assert(M::layer("vlan[]") == nanocraft::detail::npos);
+    CHECK(!tm.find("vlan[].vid").valid());
+    CHECK_EQ(M::layer("vlan[]"), nanocraft::detail::npos);
+  }
+
+  // 5. Dynamic span exact-size matching and zero-length span memcpy guard
+  {
+    auto tm = nanocraft::compile(eth{} / ipv4{} / udp{});
+    std::array<std::byte, 6> mac{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}, std::byte{5}, std::byte{6}};
+    std::span<const std::byte> dyn_mac(mac);
+    tm.set<"eth.dst">(dyn_mac);
+    ref::bytes f(tm.frame_size(0));
+    CHECK_EQ(tm.write(f, {}), tm.header_size);
+    CHECK_BYTES(std::span<const std::byte>(f).first(6), mac);
+    tm.patch<"eth.src">(f, dyn_mac);
+    CHECK_BYTES(std::span<const std::byte>(f).subspan(6, 6), mac);
+    // Zero-length span with nullptr data must not trigger memcpy UB
+    std::span<const std::byte> null_empty(static_cast<const std::byte*>(nullptr), 0);
+    tm.set(tm.find("eth.dst"), null_empty);
+    nanocraft::frame_ref rf(tm, f);
+    rf.set(tm.find("eth.dst"), null_empty);
+  }
+
+  // 6. matches() rejects IPv4 non-zero frag_offset and TCP options (data_offset != 5)
+  {
+    auto udp_shape = nanocraft::compile(eth{} / ipv4{} / udp{});
+    ref::bytes f(udp_shape.frame_size(4));
+    std::array<std::byte, 4> p{};
+    CHECK_EQ(udp_shape.write(f, p), udp_shape.header_size + 4);
+    CHECK(udp_shape.matches(f));
+    // Set IPv4 frag_offset = 1
+    udp_shape.patch<"ipv4.frag_offset">(f, 1);
+    CHECK(!udp_shape.matches(f));
+
+    auto tcp_shape = nanocraft::compile(eth{} / ipv4{} / tcp{});
+    ref::bytes ft(tcp_shape.frame_size(4));
+    CHECK_EQ(tcp_shape.write(ft, p), tcp_shape.header_size + 4);
+    CHECK(tcp_shape.matches(ft));
+    // Set TCP data_offset = 6 (24-byte TCP header with options)
+    tcp_shape.patch<"tcp.data_offset">(ft, 6);
+    CHECK(!tcp_shape.matches(ft));
+  }
+}
+
 int main() {
   test_constructed_vs_reference();
   test_patched_vs_reference();
@@ -498,5 +695,7 @@ int main() {
   test_frame_ref_and_matches();
   test_generic_field_kinds();
   test_tp_link();
+  test_udp_vs_tcp_zero_checksum();
+  test_audit_hardening();
   return t::done("test_template");
 }

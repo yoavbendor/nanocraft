@@ -67,6 +67,7 @@ struct checksum_spec {
   std::uint16_t cover = 0;                 ///< header kind: bytes covered (0 = the whole layer)
   std::uint8_t pseudo_proto = 0;           ///< l4 kind: protocol number in the pseudo header
   std::string_view pseudo_length_field{};  ///< l4 kind: this layer's field that the pseudo header repeats
+  bool map_zero_to_ffff = false;           ///< RFC 768 / RFC 8200: store computed 0x0000 as 0xFFFF (UDP, not TCP)
 };
 
 /// What an IP layer contributes to an l4 checksum's pseudo header.

@@ -300,6 +300,85 @@ static void ipv6_frag_case(std::size_t n, std::size_t mtu) {
   CHECK_BYTES(l4, ref::bytes(want.begin() + 54, want.end()));
 }
 
+static void test_segmenter_audit() {
+  // 1. unit == 0, !t.ok(), OOB offset_field / more_field, and count() guard
+  {
+    auto tm = nanocraft::compile(eth{} / ipv4{} / udp{} / someip{} / someip_tp{});
+    auto bad_unit = someip_tp_segments(100);
+    bad_unit.unit = 0;
+    nanocraft::segmenter s_unit(tm, bad_unit);
+    CHECK(!s_unit.ok());
+    CHECK_EQ(s_unit.count(100), std::size_t(0));
+    std::array<std::byte, 16> pay{};
+    CHECK_EQ(s_unit.run(pay, [](const nanocraft::gather&) {}), std::size_t(0));
+
+    // offset_field lies past rep_ (in udp, while after == "ipv4")
+    nanocraft::segment_spec oob_off{"ipv4", "udp.src_port", 8, "ipv4.mf", 1, 1480};
+    nanocraft::segmenter s_oob1(tm, oob_off);
+    CHECK(!s_oob1.ok());
+    CHECK_EQ(s_oob1.count(100), std::size_t(0));
+    CHECK_EQ(s_oob1.run(pay, [](const nanocraft::gather&) {}), std::size_t(0));
+
+    // more_field lies past rep_
+    nanocraft::segment_spec oob_more{"ipv4", "ipv4.frag_offset", 8, "udp.dst_port", 1, 1480};
+    nanocraft::segmenter s_oob2(tm, oob_more);
+    CHECK(!s_oob2.ok());
+    CHECK_EQ(s_oob2.count(100), std::size_t(0));
+
+    // !t.ok() template
+    auto bad_tm = nanocraft::compile(eth{} / ipv4{.total_length = 99} / udp{});
+    CHECK(!bad_tm.ok());
+    nanocraft::segmenter s_badt(bad_tm, ipv4_fragments(1500));
+    CHECK(!s_badt.ok());
+    CHECK_EQ(s_badt.count(100), std::size_t(0));
+    CHECK_EQ(s_badt.run(pay, [](const nanocraft::gather&) {}), std::size_t(0));
+  }
+
+  // 2. L4 checksum in head_mask_ AND rep_ < H (non-empty tail after replicated layer)
+  // Stack: eth / ipv4 / udp / someip / someip_tp / soad_pdu_header
+  // Segmenting after someip_tp puts udp.checksum in head_mask_ and leaves 8-byte soad in tail!
+  {
+    auto tm = nanocraft::compile(eth{.dst = {1, 2, 3, 4, 5, 6}, .src = {2, 0, 0, 0, 0, 1}} /
+                                 ipv4{.src = {10, 0, 0, 1}, .dst = {10, 0, 0, 2}, .id = 0x55} /
+                                 udp{.src_port = 30501, .dst_port = 30502} /
+                                 someip{.service_id = 0x1234, .method_id = 0x8001, .session_id = 9} /
+                                 someip_tp{} / soad_pdu_header{.id = 0xdeadbeef});
+    CHECK(tm.ok());
+    nanocraft::segmenter seg(tm, someip_tp_segments(32));
+    CHECK(seg.ok());
+    CHECK(seg.header_bytes() < tm.header_size);
+    for (std::size_t pay_len : {0u, 1u, 15u, 24u, 25u, 64u, 100u}) {
+      const auto pay = t::random_bytes(pay_len);
+      std::size_t count = 0;
+      const std::size_t nseg = seg.run(pay, [&](const nanocraft::gather& g) {
+        const auto f = flat(g);
+        const auto v = ref::verify(f);
+        CHECK(v.parsed && v.ip_ok && v.lengths_ok && v.udp_ok);
+        ++count;
+      });
+      CHECK_EQ(nseg, count);
+      CHECK(nseg >= 1);
+    }
+  }
+
+  // 3. IPv4 fragmentation rejects >65535B UDP datagram instead of silently truncating udp.length
+  {
+    auto tm = nanocraft::compile(eth{} / ipv4{.src = {10, 0, 0, 1}, .dst = {10, 0, 0, 2}} /
+                                 udp{.src_port = 1000, .dst_port = 2000});
+    nanocraft::segmenter seg(tm, ipv4_fragments(1500));
+    CHECK(seg.ok());
+    // 65530 + 8 (UDP header) = 65538 > 65535 (while frag_offset = 44 * 185 = 8140 <= 8191!)
+    std::vector<std::byte> huge(65530, std::byte{0xab});
+    std::size_t emitted = 0;
+    CHECK_EQ(seg.run(huge, [&](const nanocraft::gather&) { ++emitted; }), std::size_t(0));
+    CHECK_EQ(emitted, std::size_t(0));
+    // 65527 + 8 = 65535 fits udp.length (65535) and frag_offset (8140 <= 8191) -> accepted!
+    std::vector<std::byte> max_udp(65527, std::byte{0xcd});
+    CHECK(seg.run(max_udp, [&](const nanocraft::gather&) { ++emitted; }) > 0);
+    CHECK(emitted > 0);
+  }
+}
+
 int main() {
   for (std::size_t n : {0, 1, 15, 16, 17, 1391, 1392, 1393, 2784, 5000, 65536})
     for (std::size_t mx : {1392, 1400, 16, 100}) {
@@ -321,7 +400,9 @@ int main() {
   auto tm = nanocraft::compile(eth{} / ipv4{} / udp{});
   nanocraft::segmenter bad(tm, someip_tp_segments());
   CHECK(!bad.ok());
+  CHECK_EQ(bad.count(4), std::size_t(0));
   std::array<std::byte, 4> pay{};
   CHECK_EQ(bad.run(pay, [](const nanocraft::gather&) {}), std::size_t(0));
+  test_segmenter_audit();
   return t::done("test_segment");
 }

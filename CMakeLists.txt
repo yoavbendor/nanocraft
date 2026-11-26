@@ -28,9 +28,9 @@ set(NANOCRAFT_SANITIZER "" CACHE STRING "Sanitizers for tests/bench/examples: ''
 #      SYSTEM: their headers are not subject to nanocraft's -Wshadow / -Werror.
 include(FetchContent)
 set(NANOCRAFT_NANOM_GIT_URL "https://github.com/yoavbendor/nanom.git" CACHE STRING "nanom repository")
-set(NANOCRAFT_NANOM_GIT_TAG "12f9e2bf36c439802ae3e36e01dad3a70aa96539" CACHE STRING "nanom commit")
+set(NANOCRAFT_NANOM_GIT_TAG "0dc07ab3dccd58ea677b512cbcd61104966ed085" CACHE STRING "nanom commit")
 set(NANOCRAFT_NANOWIRE_GIT_URL "https://github.com/yoavbendor/nanowire.git" CACHE STRING "nanowire repository")
-set(NANOCRAFT_NANOWIRE_GIT_TAG "1aa46551b12120028b35e544a6b0d39a48bc45f9" CACHE STRING "nanowire commit")
+set(NANOCRAFT_NANOWIRE_GIT_TAG "56aac902c8d9d8294cd20ee6b004204bfddb8fe0" CACHE STRING "nanowire commit")
 if(NOT TARGET nanom::nanom)
   FetchContent_Declare(nanom
     GIT_REPOSITORY ${NANOCRAFT_NANOM_GIT_URL}
@@ -68,9 +68,13 @@ if(NOT (NANOCRAFT_BUILD_TESTS OR NANOCRAFT_BUILD_BENCH OR NANOCRAFT_BUILD_EXAMPL
 endif()
 
 add_library(nanocraft_dev_flags INTERFACE)
-target_compile_options(nanocraft_dev_flags INTERFACE -Wall -Wextra -Wpedantic -Wshadow)
+target_compile_options(nanocraft_dev_flags INTERFACE
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic -Wshadow>
+  $<$<CXX_COMPILER_ID:MSVC>:/W4>)
 if(NANOCRAFT_WERROR)
-  target_compile_options(nanocraft_dev_flags INTERFACE -Werror)
+  target_compile_options(nanocraft_dev_flags INTERFACE
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Werror>
+    $<$<CXX_COMPILER_ID:MSVC>:/WX>)
 endif()
 if(NANOCRAFT_SANITIZER)
   target_compile_options(nanocraft_dev_flags INTERFACE -fsanitize=${NANOCRAFT_SANITIZER} -fno-omit-frame-pointer

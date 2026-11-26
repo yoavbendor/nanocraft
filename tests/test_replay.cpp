@@ -93,14 +93,50 @@ int main() {
     std::printf("replay at 4x: %.1f ms for 29.5 ms of scaled capture, max lateness %.1f us\n", ms,
                 double(st.max_late_ns) / 1000.0);
   }
-  // 4. a malformed capture reports its error
+  // 4. a malformed capture reports its error (owning std::string survives reader destruction)
   {
     auto bad = file;
     bad.resize(bad.size() - 5);
-    nanocraft::capture_reader r(bad);
-    auto st = nanocraft::replay(r, [](std::span<const std::byte>, std::uint64_t) { return true; }, {.speed = 0});
+    nanocraft::replay_stats st;
+    {
+      nanocraft::capture_reader r(bad);
+      st = nanocraft::replay(r, [](std::span<const std::byte>, std::uint64_t) { return true; }, {.speed = 0});
+    }
     CHECK_EQ(st.packets, std::uint64_t(59));
     CHECK(!st.error.empty());
+    CHECK(st.error.find("truncated") != std::string::npos);
+  }
+  // 5. invalid / non-finite speeds run unpaced without UB; empty packet with rewrite has no memcpy UB
+  {
+    std::vector<std::byte> empty_cap;
+    {
+      nanocraft::pcap_writer w(nanocraft::output::buffer(empty_cap));
+      CHECK(w.write(1'000'000'000ull, std::span<const std::byte>{}));
+      CHECK(w.write(1'000'000'123ull, std::span<const std::byte>{}));
+    }
+    for (double spd : {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
+                       -std::numeric_limits<double>::infinity(), -2.0}) {
+      nanocraft::capture_reader r(empty_cap);
+      auto st = nanocraft::replay(
+          r, [](std::span<const std::byte>, std::uint64_t) { return true; }, {.speed = spd},
+          [](std::span<std::byte> m, const nanocraft::packet&) { return m.empty(); });
+      CHECK_EQ(st.packets, std::uint64_t(2));
+      CHECK(st.error.empty());
+    }
+    // speed == 1.0 exact integer timestamp path (no double precision loss)
+    {
+      nanocraft::capture_reader r(empty_cap);
+      std::vector<std::uint64_t> ts;
+      auto st = nanocraft::replay(
+          r,
+          [&](std::span<const std::byte>, std::uint64_t t) {
+            ts.push_back(t);
+            return true;
+          },
+          {.speed = 1.0});
+      CHECK_EQ(st.packets, std::uint64_t(2));
+      if (ts.size() == 2) CHECK_EQ(ts[1], 1'000'000'123ull);
+    }
   }
   return t::done("test_replay");
 }

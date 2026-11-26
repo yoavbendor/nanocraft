@@ -69,6 +69,7 @@ struct output {
                   if (errno == EINTR) continue;
                   return false;
                 }
+                if (w == 0) return false;
                 p += w;
                 n -= std::size_t(w);
               }
@@ -90,6 +91,7 @@ class write_buffer {
 
   /// Space for n bytes (valid until the next reserve/flush), or null after an output failure.
   std::byte* reserve(std::size_t n) {
+    if (!ok_) return nullptr;
     if (n > buf_.size() - used_) {
       if (!flush()) return nullptr;
       if (n > buf_.size()) buf_.resize(n);
@@ -99,6 +101,10 @@ class write_buffer {
   void commit(std::size_t n) noexcept {
     used_ += n;
     total_ += n;
+  }
+  void fail() noexcept {
+    ok_ = false;
+    used_ = 0;
   }
   bool flush() {
     if (!ok_) return false;
@@ -165,15 +171,20 @@ class pcap_writer {
 
   /// Reserve a record for a frame of up to `len` bytes; fill the returned span, then end().
   std::span<std::byte> begin(std::uint64_t ts_ns, std::size_t len) {
+    pending_ = nullptr;
     std::byte* w = buf_.reserve(16 + len);
     if (!w) return {};
     pending_ = w;
     pending_ts_ = ts_ns;
+    pending_len_ = len;
     return {w + 16, len};
   }
   /// Finish the record begun with begin(); `len` is the frame's real length (<= reserved).
   bool end(std::size_t len) {
-    if (!pending_) return false;
+    if (!pending_ || len > pending_len_) {
+      pending_ = nullptr;
+      return false;
+    }
     const std::uint32_t cap = std::uint32_t(std::min<std::size_t>(len, o_.snaplen));
     std::byte* p = pending_;
     const std::uint64_t div = o_.nanosecond ? 1 : 1000;
@@ -191,7 +202,7 @@ class pcap_writer {
     NANOCRAFT_PROFILE_SCOPE(pcap_write);
     auto s = begin(ts_ns, frame.size());
     if (!s.data()) return false;
-    std::memcpy(s.data(), frame.data(), frame.size());
+    if (!frame.empty()) std::memcpy(s.data(), frame.data(), frame.size());
     return end(frame.size());
   }
   bool write(std::uint64_t ts_ns, const gather& g) {
@@ -205,12 +216,17 @@ class pcap_writer {
   template <detail::frame_template_like T>
   bool write(std::uint64_t ts_ns, T& tmpl, std::span<const std::byte> payload) {
     NANOCRAFT_PROFILE_SCOPE(pcap_write);
+    if constexpr (requires { tmpl.ok(); })
+      if (!tmpl.ok()) return false;
     auto s = begin(ts_ns, tmpl.frame_size(payload.size()));
     if (!s.data()) return false;
     return end(tmpl.write(s, payload));
   }
 
-  bool flush() { return buf_.flush(); }
+  bool flush() {
+    pending_ = nullptr;
+    return buf_.flush();
+  }
   bool ok() const noexcept { return buf_.ok(); }
   std::uint64_t frames() const noexcept { return frames_; }
   std::uint64_t bytes() const noexcept { return buf_.bytes(); }
@@ -220,6 +236,7 @@ class pcap_writer {
   detail::write_buffer buf_;
   std::byte* pending_ = nullptr;
   std::uint64_t pending_ts_ = 0;
+  std::size_t pending_len_ = 0;
   std::uint64_t frames_ = 0;
 };
 
@@ -245,6 +262,10 @@ class pcapng_writer {
  public:
   explicit pcapng_writer(output out, std::size_t buffer_size = 1 << 20, std::string_view userappl = "nanocraft")
       : buf_(out, buffer_size) {
+    if (userappl.size() > 0xffffu) {
+      buf_.fail();
+      return;
+    }
     const std::size_t opts = userappl.empty() ? 0 : option_size(userappl.size()) + 4;
     const std::size_t total = 28 + opts;
     std::byte* w = buf_.reserve(total);
@@ -264,8 +285,10 @@ class pcapng_writer {
     buf_.commit(total);
   }
 
-  /// Add an interface (writes an IDB); returns its id for write().
+  /// Add an interface (writes an IDB); returns its id for write() (or ~0u on invalid options/failure).
   std::uint32_t add_interface(const pcapng_interface& i) {
+    pending_ = nullptr;
+    if (i.tsresol > 9 || i.name.size() > 0xffffu || i.description.size() > 0xffffu) return ~0u;
     std::size_t opts = 0;
     if (!i.name.empty()) opts += option_size(i.name.size());
     if (!i.description.empty()) opts += option_size(i.description.size());
@@ -295,17 +318,22 @@ class pcapng_writer {
   /// Reserve an EPB for a frame of up to `len` bytes; fill the span, then end(). The options
   /// (copied into the block at end()) must stay valid until then.
   std::span<std::byte> begin(std::uint32_t iface, std::uint64_t ts_ns, std::size_t len, const epb_options& o = {}) {
-    if (iface >= ifaces_.size()) return {};
+    pending_ = nullptr;
+    if (iface >= ifaces_.size() || o.comment.size() > 0xffffu) return {};
     std::byte* w = buf_.reserve(28 + detail::pad4(len) + options_size(o) + 4);
     if (!w) return {};
     pending_ = w;
     p_iface_ = iface;
     p_ts_ = ts_ns;
+    p_len_ = len;
     p_opts_ = o;
     return {w + 28, len};
   }
   bool end(std::size_t len) {
-    if (!pending_) return false;
+    if (!pending_ || len > p_len_) {
+      pending_ = nullptr;
+      return false;
+    }
     const auto& itf = ifaces_[p_iface_];
     const std::size_t cap = itf.snaplen ? std::min<std::size_t>(len, itf.snaplen) : len;
     const std::size_t opts = options_size(p_opts_);
@@ -338,7 +366,7 @@ class pcapng_writer {
     NANOCRAFT_PROFILE_SCOPE(pcap_write);
     auto s = begin(iface, ts_ns, frame.size(), o);
     if (!s.data()) return false;
-    std::memcpy(s.data(), frame.data(), frame.size());
+    if (!frame.empty()) std::memcpy(s.data(), frame.data(), frame.size());
     return end(frame.size());
   }
   bool write(std::uint32_t iface, std::uint64_t ts_ns, const gather& g, const epb_options& o = {}) {
@@ -352,12 +380,17 @@ class pcapng_writer {
   bool write(std::uint32_t iface, std::uint64_t ts_ns, T& tmpl, std::span<const std::byte> payload,
              const epb_options& o = {}) {
     NANOCRAFT_PROFILE_SCOPE(pcap_write);
+    if constexpr (requires { tmpl.ok(); })
+      if (!tmpl.ok()) return false;
     auto s = begin(iface, ts_ns, tmpl.frame_size(payload.size()), o);
     if (!s.data()) return false;
     return end(tmpl.write(s, payload));
   }
 
-  bool flush() { return buf_.flush(); }
+  bool flush() {
+    pending_ = nullptr;
+    return buf_.flush();
+  }
   bool ok() const noexcept { return buf_.ok(); }
   std::uint64_t frames() const noexcept { return frames_; }
   std::uint64_t bytes() const noexcept { return buf_.bytes(); }
@@ -373,7 +406,7 @@ class pcapng_writer {
   static void put_option(std::byte*& p, std::uint16_t code, const void* v, std::size_t n) noexcept {
     detail::put<std::uint16_t>(p, code);
     detail::put<std::uint16_t>(p, std::uint16_t(n));
-    std::memcpy(p, v, n);
+    if (n > 0) std::memcpy(p, v, n);
     p += n;
     for (std::size_t k = n; k < detail::pad4(n); ++k) *p++ = std::byte{0};
   }
@@ -388,6 +421,7 @@ class pcapng_writer {
   std::byte* pending_ = nullptr;
   std::uint32_t p_iface_ = 0;
   std::uint64_t p_ts_ = 0;
+  std::size_t p_len_ = 0;
   epb_options p_opts_{};
   std::uint64_t frames_ = 0;
 };

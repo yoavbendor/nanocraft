@@ -113,6 +113,7 @@ struct slot_desc {
   std::int32_t alias = -1;        ///< l4: offset of the length field the pseudo header repeats
   std::uint8_t proto = 0;         ///< l4: pseudo-header protocol
   bool zero_ok = false;           ///< l4: a stored 0 means "no checksum"
+  bool map_zero_to_ffff = false;  ///< RFC 768 / RFC 8200: map computed 0x0000 to 0xFFFF
   bool odd_payload = false;       ///< l4: the payload starts at an odd position of the stream
 };
 
@@ -140,7 +141,7 @@ constexpr field_kind kind_of() {
     return F::order == nanom::bit_order::msb0 ? field_kind::bits_msb0 : field_kind::bits_lsb0;
   } else if constexpr (requires(F f) { f.raw; F::order; typename F::value_type; }) {
     return F::order == std::endian::big ? field_kind::be : field_kind::le;
-  } else if constexpr (nanom::detail::is_std_array_v<F>) {
+  } else if constexpr (nanom::is_std_array_v<F>) {
     static_assert(sizeof(typename F::value_type) == 1, "nanocraft: arrays must be byte arrays");
     return field_kind::bytes;
   } else if constexpr (std::is_integral_v<F>) {
@@ -191,7 +192,7 @@ struct stack_meta {
   static constexpr std::array<std::string_view, nlayers> names{std::string_view(layer_info<L>::name)...};
   static constexpr std::array<bool, nlayers> is_ip{has_pseudo<L>()...};
   static constexpr std::array<pseudo_spec, nlayers> pseudos{pseudo_of<L>()...};
-  static constexpr std::size_t nfields = (std::size_t{0} + ... + nanom::detail::field_count_v<wire_t<L>>);
+  static constexpr std::size_t nfields = (std::size_t{0} + ... + nanom::field_count_v<wire_t<L>>);
 
   static constexpr std::array<field_desc, nfields> fields = [] {
     std::array<field_desc, nfields> out{};
@@ -199,13 +200,13 @@ struct stack_meta {
     (
         [&] {
           using T = wire_t<L>;
-          constexpr auto offs = nanom::detail::field_bit_offsets<T>();
+          constexpr auto offs = nanom::field_bit_offsets<T>();
           std::uint16_t occ = 0;
           for (std::size_t j = 0; j < li; ++j)
             if (str_eq(names[j], names[li])) ++occ;
           std::size_t fi = 0;
-          nanom::detail::for_each_field<T>([&](auto f) {
-            using F = nanom::detail::member_t<decltype(f)::mem_ptr>;
+          nanom::for_each_field<T>([&](auto f) {
+            using F = nanom::member_t<decltype(f)::mem_ptr>;
             field_desc d{};
             d.layer = names[li];
             d.name = decltype(f)::name.sv();
@@ -253,7 +254,7 @@ struct stack_meta {
     std::string_view lay = path.substr(0, dot), fld = path.substr(dot + 1);
     std::size_t occ = 0;
     if (const auto br = str_find(lay, '['); br != npos) {
-      if (lay.back() != ']') return npos;
+      if (lay.back() != ']' || br + 2 >= lay.size()) return npos;
       occ = 0;
       for (std::size_t i = br + 1; i + 1 < lay.size(); ++i) {
         if (lay[i] < '0' || lay[i] > '9') return npos;
@@ -270,7 +271,7 @@ struct stack_meta {
   static constexpr std::size_t layer(std::string_view path) {
     std::size_t occ = 0;
     if (const auto br = str_find(path, '['); br != npos) {
-      if (path.back() != ']') return npos;
+      if (path.back() != ']' || br + 2 >= path.size()) return npos;
       for (std::size_t i = br + 1; i + 1 < path.size(); ++i) {
         if (path[i] < '0' || path[i] > '9') return npos;
         occ = occ * 10 + std::size_t(path[i] - '0');
@@ -315,6 +316,7 @@ struct stack_meta {
             d.field = std::uint16_t(f);
             d.off = fields[f].off;
             d.kind = s.kind;
+            d.map_zero_to_ffff = s.map_zero_to_ffff;
             if (s.kind == checksum_kind::header) {
               d.cover = {std::uint16_t(offsets[li]), std::uint16_t(offsets[li] + (s.cover ? s.cover : sizes[li]))};
             } else {
@@ -327,7 +329,7 @@ struct stack_meta {
               if (ip == npos) throw "nanocraft: an l4 checksum needs an IP layer below it";
               d.pseudo = {std::uint16_t(offsets[ip] + pseudos[ip].addr_off),
                           std::uint16_t(offsets[ip] + pseudos[ip].addr_off + pseudos[ip].addr_len)};
-              d.zero_ok = pseudos[ip].zero_checksum_ok;
+              d.zero_ok = pseudos[ip].zero_checksum_ok && s.map_zero_to_ffff;
               d.cover = {std::uint16_t(offsets[li]), std::uint16_t(header_size)};
               d.proto = s.pseudo_proto;
               if (!s.pseudo_length_field.empty()) {
@@ -344,6 +346,17 @@ struct stack_meta {
         ...);
     return out;
   }();
+  static_assert([] {
+    for (std::size_t i = 0; i < nslots; ++i)
+      for (std::size_t j = 0; j < nslots; ++j) {
+        if (i == j) continue;
+        if (slots[i].off < slots[j].cover.end && std::size_t(slots[i].off) + 2 > slots[j].cover.begin) return false;
+        if (slots[j].kind == checksum_kind::l4 && slots[i].off < slots[j].pseudo.end &&
+            std::size_t(slots[i].off) + 2 > slots[j].pseudo.begin)
+          return false;
+      }
+    return true;
+  }(), "nanocraft: nested checksum slots are not supported (a checksum falls inside another slot's coverage)");
 
   // ---- per patch point: the checksum windows it touches
   static constexpr std::size_t max_effects = 4;
@@ -533,6 +546,7 @@ inline void patch_with(std::byte* frame, const effect* e, std::size_t ne, const 
     std::uint16_t c = load16(cp);
     if (m == mode_checksum) {
       for (std::uint8_t r = 0; r < e[i].mult; ++r) c = csum::update(c, old[i], nw);
+      if (slots[e[i].slot].map_zero_to_ffff && c == 0) c = 0xffff;
     } else {
       const std::uint8_t reps = e[i].pseudo ? 1 : std::uint8_t(e[i].mult - 1);
       for (std::uint8_t r = 0; r < reps; ++r) c = csum::update_sum(c, old[i], nw);
@@ -556,6 +570,19 @@ struct is_byte_range<std::array<E, N>> : std::bool_constant<sizeof(E) == 1> {};
 template <class E, std::size_t N>
 struct is_byte_range<std::span<E, N>> : std::bool_constant<sizeof(E) == 1> {};
 
+template <class T>
+struct byte_range_extent {
+  static constexpr std::size_t value = std::dynamic_extent;
+};
+template <class E, std::size_t N>
+struct byte_range_extent<std::array<E, N>> {
+  static constexpr std::size_t value = N;
+};
+template <class E, std::size_t N>
+struct byte_range_extent<std::span<E, N>> {
+  static constexpr std::size_t value = N;
+};
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------------------------
@@ -568,27 +595,38 @@ struct faults {
     std::string_view field;
     std::int32_t delta = 0;
   };
-  std::array<std::string_view, 4> bad_checksums{};
-  std::array<length_fault, 4> lengths{};
+  std::array<std::string_view, 8> bad_checksums{};
+  std::array<length_fault, 8> lengths{};
   std::size_t truncate = 0;
   std::uint32_t period = 1;
+  bool overflow = false;
 
   /// Write a wrong value to this checksum field ("ipv4.checksum", "udp.checksum").
   constexpr faults& bad_checksum(std::string_view field) {
+    if (field.empty()) {
+      overflow = true;
+      return *this;
+    }
     for (auto& s : bad_checksums)
       if (s.empty()) {
         s = field;
-        break;
+        return *this;
       }
+    overflow = true;
     return *this;
   }
   /// Add delta to this length field (checksums stay consistent with the wrong length).
   constexpr faults& length_delta(std::string_view field, std::int32_t delta) {
+    if (field.empty()) {
+      overflow = true;
+      return *this;
+    }
     for (auto& l : lengths)
       if (l.field.empty()) {
         l = {field, delta};
-        break;
+        return *this;
       }
+    overflow = true;
     return *this;
   }
   /// Drop the last n bytes of the frame.
@@ -691,8 +729,23 @@ class frame_template {
     static constexpr field_desc f = meta::fields[I];
     assert(frame.size() >= header_size);
     std::byte* fr = frame.data();
-    if constexpr (detail::is_byte_range<V>::value) patch_ct<I>(fr, [&] { std::memcpy(fr + f.off, v.data(), f.len); });
-    else patch_ct<I>(fr, [&] { detail::write_field(fr, f, std::uint64_t(v)); });
+    if constexpr (detail::is_byte_range<std::remove_cvref_t<V>>::value) {
+      static_assert(f.kind == field_kind::bytes, "nanocraft: byte range passed to a non-byte-array field");
+      constexpr std::size_t ext = detail::byte_range_extent<std::remove_cvref_t<V>>::value;
+      if constexpr (ext != std::dynamic_extent) {
+        static_assert(ext == f.len, "nanocraft: byte array/span size does not match field size");
+      } else {
+        assert(v.size() == f.len);
+        if (v.size() != f.len) return;
+      }
+      patch_ct<I>(fr, [&] {
+        if (f.len > 0) std::memcpy(fr + f.off, v.data(), f.len);
+      });
+    } else {
+      static_assert(std::is_integral_v<V> || std::is_enum_v<V>,
+                    "nanocraft: patch() takes an integer or a byte array");
+      patch_ct<I>(fr, [&] { detail::write_field(fr, f, std::uint64_t(v)); });
+    }
   }
 
   void set(field_id id, std::uint64_t v) noexcept {
@@ -704,9 +757,11 @@ class frame_template {
   void set(field_id id, std::span<const std::byte> v) noexcept {
     assert(id.valid());
     const auto& f = meta::fields[id.index];
+    const std::size_t n = std::min<std::size_t>(v.size(), f.len);
+    if (n == 0) return;
     const auto& eff = meta::effects[id.index];
     detail::patch_with(img_.data(), eff.e.data(), eff.n, meta::slots.data(), mode_.data(),
-                       [&] { std::memcpy(img_.data() + f.off, v.data(), std::min<std::size_t>(v.size(), f.len)); });
+                       [&] { std::memcpy(img_.data() + f.off, v.data(), n); });
   }
   template <nanom::fixed_string Path>
   std::uint64_t get() const noexcept {
@@ -752,8 +807,11 @@ class frame_template {
               const std::uint32_t b = std::uint32_t(header_size + n - s.cover.begin);
               const std::uint32_t os = (a >> 16) + (a & 0xffff), ns = (b >> 16) + (b & 0xffff);
               std::byte* cp = img_.data() + s.off;
-              detail::store16(cp, mode_[K] == detail::mode_checksum ? csum::update(detail::load16(cp), os, ns)
-                                                                    : csum::update_sum(detail::load16(cp), os, ns));
+              std::uint16_t nc = mode_[K] == detail::mode_checksum ? csum::update(detail::load16(cp), os, ns)
+                                                                   : csum::update_sum(detail::load16(cp), os, ns);
+              if constexpr (s.map_zero_to_ffff)
+                if (mode_[K] == detail::mode_checksum && nc == 0) nc = 0xffff;
+              detail::store16(cp, nc);
             }
           }(),
           ...);
@@ -774,14 +832,16 @@ class frame_template {
   /// that produce the payload in place (sensor data serialized straight into the frame). Finish
   /// with commit(dst, n). Empty span if dst is too small.
   NANOCRAFT_INLINE std::span<std::byte> prepare(std::span<std::byte> dst, std::size_t n) noexcept {
-    if (!fits(dst.size(), n)) return {};
+    if (!ok() || !fits(dst.size(), n)) return {};
     payload_size(n);
-    std::memcpy(dst.data(), img_.data(), header_size);
+    if constexpr (header_size > 0) std::memcpy(dst.data(), img_.data(), header_size);
     return dst.subspan(header_size, n);
   }
   /// Finish a frame whose payload (n bytes) is in place after prepare(): L4 checksums over the
   /// payload, padding, faults. Returns the frame length.
   NANOCRAFT_INLINE std::size_t commit(std::span<std::byte> dst, std::size_t n) noexcept {
+    if (!ok()) [[unlikely]]
+      return 0;
     NANOCRAFT_PROFILE_SCOPE(template_write);
     std::byte* f = dst.data();
     if (n) {
@@ -795,7 +855,8 @@ class frame_template {
                 if constexpr (s.odd_payload) ps = csum::swap(ps);
                 std::uint16_t c =
                     std::uint16_t(~csum::fold(std::uint32_t(std::uint16_t(~detail::load16(f + s.off))) + ps));
-                if (c == 0) c = 0xffff;
+                if constexpr (s.map_zero_to_ffff)
+                  if (c == 0) c = 0xffff;
                 detail::store16(f + s.off, c);
               }
             }(),
@@ -815,10 +876,10 @@ class frame_template {
   /// One frame: headers + payload into dst. Returns the frame length (0 if dst is too small).
   NANOCRAFT_INLINE std::size_t write(std::span<std::byte> dst, std::span<const std::byte> payload) noexcept {
     const std::size_t n = payload.size();
-    if (!fits(dst.size(), n)) [[unlikely]]
+    if (!ok() || !fits(dst.size(), n)) [[unlikely]]
       return 0;
     payload_size(n);
-    std::memcpy(dst.data(), img_.data(), header_size);
+    if constexpr (header_size > 0) std::memcpy(dst.data(), img_.data(), header_size);
     detail::copy_payload(dst.data() + header_size, payload.data(), n);
     return commit(dst, n);
   }
@@ -827,6 +888,7 @@ class frame_template {
 
   /// Resolve and arm a fault policy. False (nothing armed) if a name does not resolve.
   bool inject(const faults& fs) noexcept {
+    if (fs.overflow) return false;
     compiled_faults c{};
     for (auto s : fs.bad_checksums) {
       if (s.empty()) continue;
@@ -842,7 +904,7 @@ class frame_template {
     for (const auto& l : fs.lengths) {
       if (l.field.empty()) continue;
       const std::size_t f = meta::find(l.field);
-      if (f == detail::npos) return false;
+      if (f == detail::npos || c.nlen >= c.len.size()) return false;
       c.len[c.nlen++] = {std::uint16_t(f), l.delta};
     }
     c.truncate = fs.truncate;
@@ -893,9 +955,18 @@ class frame_template {
   NANOCRAFT_INLINE void set_index(const V& v) noexcept {
     static constexpr field_desc f = meta::fields[I];
     std::byte* img = img_.data();
-    if constexpr (detail::is_byte_range<V>::value) {
-      assert(f.kind == field_kind::bytes && v.size() == f.len);
-      patch_ct<I>(img, [&] { std::memcpy(img + f.off, v.data(), f.len); });
+    if constexpr (detail::is_byte_range<std::remove_cvref_t<V>>::value) {
+      static_assert(f.kind == field_kind::bytes, "nanocraft: byte range passed to a non-byte-array field");
+      constexpr std::size_t ext = detail::byte_range_extent<std::remove_cvref_t<V>>::value;
+      if constexpr (ext != std::dynamic_extent) {
+        static_assert(ext == f.len, "nanocraft: byte array/span size does not match field size");
+      } else {
+        assert(v.size() == f.len);
+        if (v.size() != f.len) return;
+      }
+      patch_ct<I>(img, [&] {
+        if (f.len > 0) std::memcpy(img + f.off, v.data(), f.len);
+      });
     } else {
       static_assert(std::is_integral_v<V> || std::is_enum_v<V>, "nanocraft: set() takes an integer or a byte array");
       patch_ct<I>(img, [&] { detail::write_field(img, f, std::uint64_t(v)); });
@@ -930,7 +1001,10 @@ class frame_template {
                 // ~c + mult * (~o + n)
                 const std::uint32_t d = std::uint32_t(std::uint16_t(~o)) + nw;
                 std::uint32_t x = std::uint32_t(std::uint16_t(~c)) + d * e.mult;
-                detail::store16(cp, std::uint16_t(~detail::fold32(x)));
+                std::uint16_t nc = std::uint16_t(~detail::fold32(x));
+                if constexpr (meta::slots[e.slot].map_zero_to_ffff)
+                  if (nc == 0) nc = 0xffff;
+                detail::store16(cp, nc);
               } else {
                 const std::uint32_t reps = e.pseudo ? 1u : e.mult - 1u;
                 const std::uint32_t d = std::uint32_t(std::uint16_t(~o)) + nw;
@@ -958,6 +1032,7 @@ class frame_template {
       case csum_policy::offload: {
         if (s.kind == checksum_kind::header) {
           v = csum::finish(csum::sum(p + s.cover.begin, s.cover.end - s.cover.begin));
+          if (s.map_zero_to_ffff && v == 0) v = 0xffff;
           break;
         }
         const std::uint32_t l4len = s.alias >= 0 ? detail::load16(p + s.alias)
@@ -967,7 +1042,7 @@ class frame_template {
           v = csum::fold(ps);
         } else {
           v = csum::finish(csum::add(ps, csum::sum(p + s.cover.begin, s.cover.end - s.cover.begin)));
-          if (v == 0) v = 0xffff;
+          if (s.map_zero_to_ffff && v == 0) v = 0xffff;
         }
         break;
       }
@@ -981,7 +1056,7 @@ class frame_template {
       std::uint16_t field = 0;
       std::int32_t delta = 0;
     };
-    std::array<lf, 4> len{};
+    std::array<lf, 8> len{};
     std::uint8_t nlen = 0;
     std::size_t truncate = 0;
     std::uint32_t period = 1;
@@ -1000,6 +1075,7 @@ class frame_template {
         std::byte* c = f + meta::slots[k].off;
         c[0] ^= std::byte{0x5a};
         c[1] ^= std::byte{0xa5};
+        if (meta::slots[k].zero_ok && c[0] == std::byte{0} && c[1] == std::byte{0}) c[1] ^= std::byte{1};
       }
     return len - std::min(len, faults_.truncate);
   }
@@ -1042,15 +1118,30 @@ class frame_ref {
   template <nanom::fixed_string Path, class V>
   void set(const V& v) noexcept {
     constexpr field_id id = frame_template<L...>::template id<Path>();
-    if constexpr (detail::is_byte_range<V>::value) set(id, std::as_bytes(std::span(v)));
-    else set(id, std::uint64_t(v));
+    static constexpr field_desc fd = meta::fields[id.index];
+    if constexpr (detail::is_byte_range<std::remove_cvref_t<V>>::value) {
+      static_assert(fd.kind == field_kind::bytes, "nanocraft: byte range passed to a non-byte-array field");
+      constexpr std::size_t ext = detail::byte_range_extent<std::remove_cvref_t<V>>::value;
+      if constexpr (ext != std::dynamic_extent) {
+        static_assert(ext == fd.len, "nanocraft: byte array/span size does not match field size");
+      } else {
+        assert(v.size() == fd.len);
+        if (v.size() != fd.len) return;
+      }
+      set(id, std::as_bytes(std::span(v)));
+    } else {
+      static_assert(std::is_integral_v<V> || std::is_enum_v<V>, "nanocraft: set() takes an integer or a byte array");
+      set(id, std::uint64_t(v));
+    }
   }
   void set(field_id id, std::uint64_t v) noexcept {
     apply(id, [&] { detail::write_field(f_.data(), meta::fields[id.index], v); });
   }
   void set(field_id id, std::span<const std::byte> v) noexcept {
     const auto& fd = meta::fields[id.index];
-    apply(id, [&] { std::memcpy(f_.data() + fd.off, v.data(), std::min<std::size_t>(v.size(), fd.len)); });
+    const std::size_t n = std::min<std::size_t>(v.size(), fd.len);
+    if (n == 0) return;
+    apply(id, [&] { std::memcpy(f_.data() + fd.off, v.data(), n); });
   }
   template <nanom::fixed_string Path>
   std::uint64_t get() const noexcept {

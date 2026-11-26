@@ -26,12 +26,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <span>
+#include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
-#include <cstdint>
-#include <span>
-#include <thread>
 #include <vector>
 
 namespace nanocraft {
@@ -45,7 +48,7 @@ struct replay_options {
 struct replay_stats {
   std::uint64_t packets = 0, bytes = 0, dropped = 0;
   std::int64_t max_late_ns = 0;     ///< worst lateness against the schedule
-  std::string_view error{};         ///< the reader's error, if the capture was malformed
+  std::string error{};              ///< the reader's error, if the capture was malformed
 };
 
 /// Pass-through rewrite.
@@ -62,22 +65,38 @@ replay_stats replay(capture_reader& r, Sink&& sink, const replay_options& o = {}
   bool first = true;
   std::uint64_t ts0 = 0;
   clk::time_point wall0{};
+  std::int64_t max_off = 0;
+  const bool paced = std::isfinite(o.speed) && o.speed > 0.0;
+  const auto spin = std::max(o.spin, std::chrono::nanoseconds{0});
   constexpr bool passthrough = std::is_same_v<std::remove_cvref_t<Rewrite>, no_rewrite>;
   while ((o.max_packets == 0 || st.packets + st.dropped < o.max_packets) && r.next(p)) {
     NANOCRAFT_PROFILE_SCOPE(replay);
     if (first) {
       ts0 = p.ts_ns;
       wall0 = clk::now();
+      max_off = std::chrono::duration_cast<std::chrono::nanoseconds>(clk::time_point::max() - wall0).count();
       first = false;
     }
     const std::uint64_t rel = p.ts_ns >= ts0 ? p.ts_ns - ts0 : 0;
     std::uint64_t ts = p.ts_ns;
-    if (o.speed > 0) {
-      const auto off = std::chrono::nanoseconds(std::int64_t(double(rel) / o.speed));
-      ts = ts0 + std::uint64_t(off.count());
+    if (paced) {
+      std::int64_t off_ns = 0;
+      if (o.speed == 1.0) {
+        off_ns = rel > std::uint64_t(max_off) ? max_off : std::int64_t(rel);
+      } else {
+        const double scaled = double(rel) / o.speed;
+        constexpr double kMaxI64 = 9223372036854774784.0;  // largest IEEE-754 double < 2^63
+        if (!std::isfinite(scaled) || scaled >= kMaxI64) {
+          off_ns = max_off;
+        } else if (scaled > 0.0) {
+          off_ns = std::min(std::int64_t(scaled), max_off);
+        }
+      }
+      const auto off = std::chrono::nanoseconds(off_ns);
+      ts = ts0 + std::uint64_t(off_ns);
       const auto deadline = wall0 + off;
       auto now = clk::now();
-      if (deadline - now > o.spin) std::this_thread::sleep_until(deadline - o.spin);
+      if (deadline > now && deadline - now > spin) std::this_thread::sleep_until(deadline - spin);
       while ((now = clk::now()) < deadline) {
       }
       st.max_late_ns = std::max<std::int64_t>(st.max_late_ns, (now - deadline).count());
@@ -85,7 +104,7 @@ replay_stats replay(capture_reader& r, Sink&& sink, const replay_options& o = {}
     std::span<const std::byte> out = p.data;
     if constexpr (!passthrough) {
       if (scratch.size() < p.data.size()) scratch.resize(p.data.size());
-      std::memcpy(scratch.data(), p.data.data(), p.data.size());
+      if (!p.data.empty()) std::memcpy(scratch.data(), p.data.data(), p.data.size());
       std::span<std::byte> m(scratch.data(), p.data.size());
       if (!rewrite(m, std::as_const(p))) {
         ++st.dropped;
@@ -98,7 +117,7 @@ replay_stats replay(capture_reader& r, Sink&& sink, const replay_options& o = {}
     st.bytes += out.size();
     NANOCRAFT_PROFILE_COUNT(replay, 1, out.size());
   }
-  st.error = r.error();
+  st.error = std::string(r.error());
   return st;
 }
 

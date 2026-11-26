@@ -30,10 +30,12 @@
 #include "gather.hpp"
 #include "profile.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -80,12 +82,12 @@ class tx_ring_view {
 
   std::size_t frame_size() const noexcept { return fsz_; }
   std::size_t frame_count() const noexcept { return n_; }
-  std::size_t max_frame() const noexcept { return fsz_ - data_offset; }
+  std::size_t max_frame() const noexcept { return (!mem_ || n_ == 0 || fsz_ <= data_offset) ? 0 : fsz_ - data_offset; }
   std::size_t cursor() const noexcept { return cur_; }
 
   /// The data area (len bytes) of the next free slot, or empty if the ring is full there.
   std::span<std::byte> acquire(std::size_t len) noexcept {
-    if (len > max_frame()) return {};
+    if (!mem_ || n_ == 0 || fsz_ <= data_offset || len > fsz_ - data_offset) return {};
     const std::uint32_t s = status(cur_);
     if (s != TP_STATUS_AVAILABLE && s != TP_STATUS_WRONG_FORMAT) return {};
     return {slot(cur_) + data_offset, len};
@@ -102,7 +104,7 @@ class tx_ring_view {
   bool write(std::span<const std::byte> frame) noexcept {
     auto s = acquire(frame.size());
     if (!s.data()) return false;
-    std::memcpy(s.data(), frame.data(), frame.size());
+    if (!frame.empty()) std::memcpy(s.data(), frame.data(), frame.size());
     commit(frame.size());
     return true;
   }
@@ -118,7 +120,9 @@ class tx_ring_view {
   bool write(T& tmpl, std::span<const std::byte> payload) noexcept {
     auto s = acquire(tmpl.frame_size(payload.size()));
     if (!s.data()) return false;
-    commit(tmpl.write(s, payload));
+    const std::size_t len = tmpl.write(s, payload);
+    if (len == 0) return false;
+    commit(len);
     return true;
   }
 
@@ -190,7 +194,7 @@ class tx_ring {
       fd_ = std::exchange(o.fd_, -1);
       map_ = std::exchange(o.map_, nullptr);
       map_len_ = std::exchange(o.map_len_, 0);
-      view_ = o.view_;
+      view_ = std::exchange(o.view_, {});
     }
     return *this;
   }
@@ -228,7 +232,9 @@ class tx_ring {
     if (map_) ::munmap(map_, map_len_);
     if (fd_ >= 0) ::close(fd_);
     map_ = nullptr;
+    map_len_ = 0;
     fd_ = -1;
+    view_ = {};
   }
   int fd_ = -1;
   void* map_ = nullptr;
@@ -254,6 +260,18 @@ inline tx_ring::result tx_ring::open(const char* ifname, const tx_ring_options& 
     r.err = e;
     return std::move(r);
   };
+  if (o.frame_size < tx_ring_view::data_offset || o.frame_count == 0 ||
+      o.frame_size > std::numeric_limits<unsigned>::max() ||
+      o.block_size > std::numeric_limits<unsigned>::max())
+    return failed("tx_ring_options", EINVAL);
+  const std::size_t block_size = std::max(o.block_size, o.frame_size);
+  const std::size_t per_block = block_size / o.frame_size;
+  if (per_block == 0) return failed("tx_ring_options", EINVAL);
+  const std::size_t block_nr = (o.frame_count - 1) / per_block + 1;
+  if (block_nr > std::numeric_limits<unsigned>::max() ||
+      block_nr > std::numeric_limits<unsigned>::max() / per_block ||
+      block_nr > std::numeric_limits<std::size_t>::max() / block_size)
+    return failed("tx_ring_options", EINVAL);
   tx_ring t;
   int idx = 0;
   t.fd_ = open_packet_socket(ifname, &idx);
@@ -270,10 +288,9 @@ inline tx_ring::result tx_ring::open(const char* ifname, const tx_ring_options& 
   }
   tpacket_req req{};
   req.tp_frame_size = unsigned(o.frame_size);
-  req.tp_block_size = unsigned(std::max(o.block_size, o.frame_size));
-  const std::size_t per_block = req.tp_block_size / req.tp_frame_size;
-  req.tp_block_nr = unsigned((o.frame_count + per_block - 1) / per_block);
-  req.tp_frame_nr = unsigned(req.tp_block_nr * per_block);
+  req.tp_block_size = unsigned(block_size);
+  req.tp_block_nr = unsigned(block_nr);
+  req.tp_frame_nr = unsigned(block_nr * per_block);
   if (::setsockopt(t.fd_, SOL_PACKET, PACKET_TX_RING, &req, sizeof req) < 0) return failed("PACKET_TX_RING", errno);
   t.map_len_ = std::size_t(req.tp_block_size) * req.tp_block_nr;
   void* m = ::mmap(nullptr, t.map_len_, PROT_READ | PROT_WRITE, MAP_SHARED, t.fd_, 0);
@@ -292,12 +309,20 @@ inline tx_ring::result tx_ring::open(const char* ifname, const tx_ring_options& 
 class mmsg_sender {
  public:
   explicit mmsg_sender(int fd, std::size_t batch = 64)
-      : fd_(fd), n_(batch ? batch : 1), msgs_(n_), iov_(n_ * gather::max_chunks), ctl_(n_ * CMSG_SPACE(sizeof(std::uint64_t))) {}
+      : fd_(fd), n_(batch ? batch : 1), msgs_(n_), iov_(n_ * gather::max_chunks), ctl_(n_) {}
+  mmsg_sender(const mmsg_sender&) = delete;
+  mmsg_sender& operator=(const mmsg_sender&) = delete;
+  mmsg_sender(mmsg_sender&&) = delete;
+  mmsg_sender& operator=(mmsg_sender&&) = delete;
 
   /// Destination for unconnected sockets (copied).
   void set_destination(const void* addr, socklen_t len) {
-    std::memcpy(&dst_, addr, std::min<std::size_t>(len, sizeof dst_));
-    dst_len_ = len;
+    if (!addr || len == 0) {
+      dst_len_ = 0;
+      return;
+    }
+    dst_len_ = std::min<socklen_t>(len, sizeof dst_);
+    std::memcpy(&dst_, addr, dst_len_);
   }
 
   /// Queue a frame (its chunks must stay valid until flush). txtime_ns: SCM_TXTIME launch time.
@@ -306,7 +331,7 @@ class mmsg_sender {
     mmsghdr& m = msgs_[used_];
     m = mmsghdr{};
     iovec* iv = &iov_[used_ * gather::max_chunks];
-    std::memcpy(iv, g.chunks.data(), sizeof(iovec) * g.count);
+    if (g.count > 0) std::memcpy(iv, g.chunks.data(), sizeof(iovec) * g.count);
     m.msg_hdr.msg_iov = iv;
     m.msg_hdr.msg_iovlen = g.count;
     if (dst_len_) {
@@ -314,7 +339,7 @@ class mmsg_sender {
       m.msg_hdr.msg_namelen = dst_len_;
     }
     if (txtime_ns) {
-      char* c = &ctl_[used_ * CMSG_SPACE(sizeof(std::uint64_t))];
+      char* c = ctl_[used_].bytes;
       std::memset(c, 0, CMSG_SPACE(sizeof(std::uint64_t)));
       m.msg_hdr.msg_control = c;
       m.msg_hdr.msg_controllen = CMSG_SPACE(sizeof(std::uint64_t));
@@ -342,9 +367,12 @@ class mmsg_sender {
       if (r < 0) {
         if (errno == EINTR) continue;
         const int e = errno;
+        NANOCRAFT_PROFILE_COUNT(tx, off, 0);
+        sent_ += off;
         used_ = 0;
         return -e;
       }
+      if (r == 0) break;
       off += std::size_t(r);
     }
     NANOCRAFT_PROFILE_COUNT(tx, off, 0);
@@ -356,11 +384,14 @@ class mmsg_sender {
   std::uint64_t sent() const noexcept { return sent_; }
 
  private:
+  struct alignas(cmsghdr) cmsg_slot {
+    char bytes[CMSG_SPACE(sizeof(std::uint64_t))];
+  };
   int fd_;
   std::size_t n_;
   std::vector<mmsghdr> msgs_;
   std::vector<iovec> iov_;
-  std::vector<char> ctl_;
+  std::vector<cmsg_slot> ctl_;
   sockaddr_storage dst_{};
   socklen_t dst_len_ = 0;
   std::size_t used_ = 0;

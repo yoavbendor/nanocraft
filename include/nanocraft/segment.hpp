@@ -47,15 +47,25 @@ class segmenter {
 
  public:
   segmenter(tmpl& t, const segment_spec& s) : t_(&t), spec_(s) {
+    if (!t.ok() || s.unit == 0) {
+      ok_ = false;
+      return;
+    }
     const std::size_t li = meta::layer(s.after);
     off_ = tmpl::find(s.offset_field);
     more_ = tmpl::find(s.more_field);
-    step_ = s.unit ? (s.max_data / s.unit) * s.unit : s.max_data;
+    step_ = (s.max_data / s.unit) * s.unit;
     if (li == detail::npos || !off_ || !more_ || step_ == 0) {
       ok_ = false;
       return;
     }
     rep_ = meta::offsets[li] + meta::sizes[li];
+    const auto& od = meta::fields[off_.index];
+    const auto& md = meta::fields[more_.index];
+    if (std::size_t(od.off) + od.len > rep_ || std::size_t(md.off) + md.len > rep_) {
+      ok_ = false;
+      return;
+    }
     for (std::size_t k = 0; k < meta::nslots; ++k)
       if (meta::slots[k].off < rep_) head_mask_ |= 1u << k;
   }
@@ -64,8 +74,9 @@ class segmenter {
   std::size_t header_bytes() const noexcept { return rep_; }
   /// Number of segments a payload of n bytes produces.
   std::size_t count(std::size_t n) const noexcept {
+    if (!ok_) return 0;
     const std::size_t d = meta::header_size - rep_ + n;
-    return d == 0 ? 1 : (d + step_ - 1) / step_;
+    return d == 0 ? 1 : 1 + (d - 1) / step_;
   }
 
   /// Segment `payload`; fn(const gather&) is called once per segment, in order. Returns the
@@ -77,9 +88,18 @@ class segmenter {
     tmpl& t = *t_;
     constexpr std::size_t H = meta::header_size;
     const std::size_t n = payload.size();
+    const std::size_t total = (H - rep_) + n;
     const std::size_t nseg = count(n);
     const auto& od = meta::fields[off_.index];
     if (od.kind != field_kind::bytes && od.bits < 64 && ((nseg - 1) * step_ / spec_.unit) > od.mask()) return 0;
+    // Reject datagrams whose length fields would overflow their wire width.
+    const std::size_t max_seg_end = rep_ + std::min(step_, total);
+    for (const auto& l : meta::lengths) {
+      const auto& fd = meta::fields[l.field];
+      const std::size_t end = fd.off < rep_ ? max_seg_end : H + n;
+      const std::int64_t lv = std::int64_t(end) - std::int64_t(l.base) + l.add;
+      if (lv < 0 || (fd.kind != field_kind::bytes && fd.bits < 64 && std::uint64_t(lv) > fd.mask())) return 0;
+    }
     t.payload_size(n);
     std::memcpy(full_.data(), t.header().data(), H);
     // L4 checksums carried in the data stream: complete them over the whole payload once.
@@ -90,11 +110,23 @@ class segmenter {
       if (s.kind != checksum_kind::l4 || ((head_mask_ >> k) & 1) || t.slot_mode(k) != detail::mode_checksum || !n)
         continue;
       if (!have_sum) payload_sum = csum::sum(payload.data(), n), have_sum = true;
-      add_to(full_.data() + s.off, s.odd_payload ? csum::swap(payload_sum) : payload_sum);
+      add_to(full_.data() + s.off, s.odd_payload ? csum::swap(payload_sum) : payload_sum, s.map_zero_to_ffff);
+    }
+    const std::span<const std::byte> tail(full_.data() + rep_, H - rep_);
+    // L4 checksums in the replicated headers already cover `tail` in t.header(); remove `tail`
+    // once here because each segment adds its own data slice (tail slice + payload slice) below.
+    if (!tail.empty()) {
+      const std::uint32_t tail_sum = csum::sum(tail);
+      for (std::size_t s = 0; s < meta::nslots; ++s) {
+        const auto& sl = meta::slots[s];
+        if (sl.kind != checksum_kind::l4 || !((head_mask_ >> s) & 1) || t.slot_mode(s) != detail::mode_checksum) continue;
+        const std::uint32_t ts = ((rep_ - sl.cover.begin) & 1) ? csum::swap(tail_sum) : tail_sum;
+        std::uint16_t c = csum::update(detail::load16(full_.data() + sl.off), ts, 0);
+        if (sl.map_zero_to_ffff && c == 0) c = 0xffff;
+        detail::store16(full_.data() + sl.off, c);
+      }
     }
     if (arena_.size() < nseg * rep_) arena_.resize(nseg * rep_);
-    const std::span<const std::byte> tail(full_.data() + rep_, H - rep_);
-    const std::size_t total = tail.size() + n;
     for (std::size_t k = 0; k < nseg; ++k) {
       const std::size_t o = k * step_;
       const std::size_t len = std::min(step_, total - o);
@@ -110,7 +142,9 @@ class segmenter {
         const std::uint32_t a = std::uint32_t(H + n - sl.cover.begin), b = std::uint32_t(rep_ + len - sl.cover.begin);
         const std::uint32_t os = (a >> 16) + (a & 0xffff), ns = (b >> 16) + (b & 0xffff);
         const std::uint16_t c = detail::load16(h + sl.off);
-        detail::store16(h + sl.off, t.slot_mode(s) == detail::mode_checksum ? csum::update(c, os, ns) : csum::update_sum(c, os, ns));
+        std::uint16_t nc = t.slot_mode(s) == detail::mode_checksum ? csum::update(c, os, ns) : csum::update_sum(c, os, ns);
+        if (t.slot_mode(s) == detail::mode_checksum && sl.map_zero_to_ffff && nc == 0) nc = 0xffff;
+        detail::store16(h + sl.off, nc);
       }
       t.patch(h, off_, o / spec_.unit, head_mask_);
       const std::uint64_t mv = detail::read_field(h, meta::fields[more_.index]);
@@ -120,8 +154,10 @@ class segmenter {
       // data = tail[o, o+len) ++ payload[...]
       std::span<const std::byte> a, b;
       if (o < tail.size()) a = tail.subspan(o, std::min(len, tail.size() - o));
-      const std::size_t bo = o + a.size() - tail.size();  // offset into payload
-      if (a.size() < len) b = payload.subspan(bo, len - a.size());
+      if (a.size() < len) {
+        const std::size_t bo = o + a.size() - tail.size();  // offset into payload
+        b = payload.subspan(bo, len - a.size());
+      }
       g.add(a);
       g.add(b);
       // L4 checksums in the replicated headers cover this segment's data
@@ -132,7 +168,7 @@ class segmenter {
         std::uint64_t acc = 0;
         if (!a.empty()) acc += (pos & 1) ? csum::swap(csum::sum(a)) : csum::sum(a);
         if (!b.empty()) acc += ((pos + a.size()) & 1) ? csum::swap(csum::sum(b)) : csum::sum(b);
-        if (len) add_to(h + sl.off, csum::fold(acc));
+        if (len) add_to(h + sl.off, csum::fold(acc), sl.map_zero_to_ffff);
       }
       NANOCRAFT_PROFILE_COUNT(segment, 1, g.size());
       fn(std::as_const(g));
@@ -148,9 +184,9 @@ class segmenter {
   }
 
  private:
-  static void add_to(std::byte* cp, std::uint32_t s) noexcept {
+  static void add_to(std::byte* cp, std::uint32_t s, bool map_zero_to_ffff) noexcept {
     std::uint16_t c = std::uint16_t(~csum::fold(std::uint32_t(std::uint16_t(~detail::load16(cp))) + s));
-    if (c == 0) c = 0xffff;
+    if (map_zero_to_ffff && c == 0) c = 0xffff;
     detail::store16(cp, c);
   }
 
