@@ -27,6 +27,13 @@ jobs:
       - name: Python oracle modules (dpkt, scapy)
         run: python3 -m pip install --user dpkt scapy
 
+      - name: OTS packet analyzers (tshark, tcpdump)
+        run: |
+          sudo apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq --no-install-recommends tshark tcpdump
+          tshark --version | head -n 1
+          tcpdump --version | head -n 1
+
       - name: Configure (nanowire + nanom via FetchContent, pinned)
         run: >
           cmake -S . -B build
@@ -45,7 +52,14 @@ jobs:
         run: cmake --build build -j4
 
       - name: Test
+        env:
+          NANOCRAFT_REQUIRE_OTS: "1"
         run: ctest --test-dir build --output-on-failure
+
+      - name: OTS piped verifiers (tshark + tcpdump)
+        env:
+          NANOCRAFT_REQUIRE_OTS: "1"
+        run: ctest --test-dir build -R ots_oracle -V
 
       - name: Live TX tests on lo (AF_PACKET needs CAP_NET_RAW)
         run: sudo ./build/tests/test_linux_tx

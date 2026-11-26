@@ -15,3 +15,14 @@ if(Python3_Interpreter_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/python_oracle.py ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(python_oracle PROPERTIES SKIP_RETURN_CODE 77 DEPENDS "test_pcap;test_nanowire" TIMEOUT 300)
 endif()
+
+# Off-the-shelf packet analyzer oracle: streams crafted pcap/pcapng to stdout and pipes into
+# `tshark -r -` (with checksum, reassembly, VLAN, SOME/IP, SOME/IP-SD/TP, and expert verifiers)
+# and `tcpdump -nn -vvv -r -`. Skipped (77) when neither tshark nor tcpdump is installed.
+add_executable(ots_craft_emitter ots_craft_emitter.cpp)
+target_link_libraries(ots_craft_emitter PRIVATE nanocraft::nanocraft nanocraft_dev_flags)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME ots_oracle
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ots_oracle.py $<TARGET_FILE:ots_craft_emitter>)
+  set_tests_properties(ots_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
