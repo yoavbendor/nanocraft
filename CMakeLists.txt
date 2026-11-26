@@ -28,9 +28,9 @@ set(NANOCRAFT_SANITIZER "" CACHE STRING "Sanitizers for tests/bench/examples: ''
 #      SYSTEM: their headers are not subject to nanocraft's -Wshadow / -Werror.
 include(FetchContent)
 set(NANOCRAFT_NANOM_GIT_URL "https://github.com/yoavbendor/nanom.git" CACHE STRING "nanom repository")
-set(NANOCRAFT_NANOM_GIT_TAG "0dc07ab3dccd58ea677b512cbcd61104966ed085" CACHE STRING "nanom commit")
+set(NANOCRAFT_NANOM_GIT_TAG "16f8ec1d1113bb6b99160949d1a9b87dcf88c374" CACHE STRING "nanom commit")
 set(NANOCRAFT_NANOWIRE_GIT_URL "https://github.com/yoavbendor/nanowire.git" CACHE STRING "nanowire repository")
-set(NANOCRAFT_NANOWIRE_GIT_TAG "56aac902c8d9d8294cd20ee6b004204bfddb8fe0" CACHE STRING "nanowire commit")
+set(NANOCRAFT_NANOWIRE_GIT_TAG "c4bc59d86c5ff5fe02477e46112d90fae9ec0b98" CACHE STRING "nanowire commit")
 if(NOT TARGET nanom::nanom)
   FetchContent_Declare(nanom
     GIT_REPOSITORY ${NANOCRAFT_NANOM_GIT_URL}
