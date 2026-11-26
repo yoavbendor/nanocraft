@@ -30,7 +30,7 @@ include(FetchContent)
 set(NANOCRAFT_NANOM_GIT_URL "https://github.com/yoavbendor/nanom.git" CACHE STRING "nanom repository")
 set(NANOCRAFT_NANOM_GIT_TAG "16f8ec1d1113bb6b99160949d1a9b87dcf88c374" CACHE STRING "nanom commit")
 set(NANOCRAFT_NANOWIRE_GIT_URL "https://github.com/yoavbendor/nanowire.git" CACHE STRING "nanowire repository")
-set(NANOCRAFT_NANOWIRE_GIT_TAG "c4bc59d86c5ff5fe02477e46112d90fae9ec0b98" CACHE STRING "nanowire commit")
+set(NANOCRAFT_NANOWIRE_GIT_TAG "cc6ed6e43eb18776cb6f26f04a773ab6653456d1" CACHE STRING "nanowire commit")
 if(NOT TARGET nanom::nanom)
   FetchContent_Declare(nanom
     GIT_REPOSITORY ${NANOCRAFT_NANOM_GIT_URL}
